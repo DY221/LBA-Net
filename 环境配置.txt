@@ -73,7 +73,7 @@ cons                                  0.4.7
 contourpy                             1.3.3
 cramjam                               2.11.0
 cryptography                          43.0.3
-cuda-python                           12.6.2.post1
+cuda-python                           9.6.2.post1
 cudf-cu12                             25.6.0
 cudf-polars-cu12                      25.6.0
 cufflinks                             0.17.3
@@ -362,7 +362,7 @@ notebook_shim                         0.2.4
 numba                                 0.60.0
 numba-cuda                            0.11.0
 numexpr                               2.11.0
-numpy                                 2.0.2
+numpy                                 1.8.2
 nvidia-cublas-cu12                    12.6.4.1
 nvidia-cuda-cupti-cu12                12.6.80
 nvidia-cuda-nvcc-cu12                 12.5.82
@@ -673,3 +673,4 @@ yfinance                              0.2.65
 zict                                  3.0.0
 zipp                                  3.23.0
 zstandard                             0.24.0
+
