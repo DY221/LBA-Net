@@ -1,128 +1,147 @@
-#消融实验
-#Model Variant	       Val Dice (%)	Test Dice (%)	Test IoU (%)	Test HD95 (mm)	Params (M)	FLOPs (G)
-#Baseline (Full LBA-Net)
-#V1 (w/o LBA-Block)
-#V2 (w/o ASPP)
-#V3 (w/o Boundary Head)
-#V4 (LBA→CBAM)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LBA-Net Ablation Study Script
+"""
 
 # ========================================
-# 1. 安装依赖（保持不变）
+# 0. 自动安装依赖
 # ========================================
-!pip install -q timm albumentations segmentation-models-pytorch matplotlib opencv-python
-!pip install -q thop  # 新增：安装统计参数/FLOPs的thop库
-# 验证thop安装
-try:
-    from thop import profile
-    print("thop库导入成功！")
-except ImportError:
-    print("thop库导入失败，请重新运行安装命令！")
-
-import os
-import cv2
-import glob
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import torchvision
-import timm
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from google.colab import drive, files
-
+# ========================================
+# 0. 环境安装（Colab 兼容版）
+# ========================================
+!pip -q install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+!pip -q install timm albumentations segmentation-models-pytorch thop scikit-learn opencv-python torchmetrics
 
 # ========================================
-# 2. 挂载 Google Drive + 数据路径（保持不变）
+# 1. 挂载 Google Drive + 数据路径
 # ========================================
+from google.colab import drive
 drive.mount('/content/drive')
 DATA_DIR = "/content/drive/MyDrive/Dataset_BUSI_with_GT"
 SAVE_DIR = "/content/drive/MyDrive/LBA-Net_Ablation"  # 保存消融结果
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ========================================
-# 3. 定义 Dataset 类（保持不变，确保数据一致性）
+# 2. 导入库
+# ========================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import train_test_split
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import time # For FPS calculation
+
+# 设置中文字体
+plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
+plt.rcParams['axes.unicode_minus'] = False
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+
+# ========================================
+# 3. Dataset 定义 (与主脚本同步更新)
 # ========================================
 class BUSIDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.transform = transform
-        self.image_paths = []
-        self.mask_paths = []
+    def __init__(self, root_dir, split='train', img_size=512):
+        #self.root, self.img_size, self.split = root, img_size, split
+        self.root = root_dir
+        self.img_size = img_size
+        self.split = split
 
-        for subfolder in ["benign", "malignant", "normal"]:
-            img_dir = os.path.join(root_dir, subfolder)
-            for img_path in glob.glob(os.path.join(img_dir, "*.png")):
-                if "_mask" in img_path:
+        cls_list = ['benign', 'malignant', 'normal']
+        all_imgs, all_masks, all_labels = [], [], []
+        for cls in cls_list:
+            cls_dir = os.path.join(self.root, cls)
+            if not os.path.isdir(cls_dir):
+                continue
+            for fname in sorted(os.listdir(cls_dir)):
+                if 'mask' in fname:
                     continue
-                mask_path = img_path.replace(".png", "_mask.png")
-                if os.path.exists(mask_path):
-                    self.image_paths.append(img_path)
-                    self.mask_paths.append(mask_path)
+                mask_name = fname.replace('.png', '_mask.png')
+                mask_path = os.path.join(cls_dir, mask_name)
+                img_path  = os.path.join(cls_dir, fname)
+                if os.path.exists(mask_path) and os.path.exists(img_path):
+                    all_imgs.append(img_path)
+                    all_masks.append(mask_path)
+                    all_labels.append(cls)
+
+        # derive case id from filename prefix
+        cases = [os.path.basename(p).split('_')[0] for p in all_imgs]
+        unique_cases = list(dict.fromkeys(cases))  # keep order
+        case_labels = [all_labels[cases.index(c)] for c in unique_cases]
+
+        # Stratified split by cases
+        train_cases, val_cases = train_test_split(
+            unique_cases, test_size=0.2, random_state=42, stratify=case_labels
+        )
+
+        is_train = [c in train_cases for c in cases]
+        self.imgs  = [all_imgs[i]  for i, flag in enumerate(is_train) if flag == (split == 'train')]
+        self.masks = [all_masks[i] for i, flag in enumerate(is_train) if flag == (split == 'train')]
+
+        # augmentations
+        if split == 'train':
+            self.aug = A.Compose([
+                A.RandomResizedCrop(size=(img_size, img_size), scale=(0.8, 1.0), ratio=(0.9, 1.1), p=1.0),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.2),
+                A.Rotate(limit=20, p=0.5),
+                A.RandomBrightnessContrast(p=0.5),
+                A.GaussianBlur(p=0.2),
+                A.GaussNoise(p=0.1),
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
+                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+                A.GridDistortion(p=0.5),
+                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+                ToTensorV2()
+            ])
+        else:
+            self.aug = A.Compose([
+                A.Resize(height=img_size, width=img_size),
+                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+                ToTensorV2()
+            ])
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.imgs)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        mask_path = self.mask_paths[idx]
+        img_path  = self.imgs[idx]
+        mask_path = self.masks[idx]
+        assert os.path.exists(mask_path), f"mask not found: {mask_path}"
 
-        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        img  = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(mask_path, 0)
+        mask = (mask > 127).astype(np.uint8)   # ensure binary 0/1
+        aug  = self.aug(image=img, mask=mask)
+        return aug['image'], aug['mask'].float().unsqueeze(0)
 
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        mask = (mask > 127).astype(np.float32)
-        boundary = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3,3), np.uint8))
+# 划分训练/验证数据集（使用Dataset类的split参数）
+# dataset = BUSIDataset(DATA_DIR, split='train', img_size=512) # This was causing the TypeError
+train_ds = BUSIDataset(DATA_DIR, split='train', img_size=512)
+val_ds   = BUSIDataset(DATA_DIR, split='val', img_size=512)
 
-        if self.transform:
-            augmented = self.transform(image=image, mask=mask, masks=[mask, boundary])
-            image = augmented['image']
-            mask = augmented['masks'][0].unsqueeze(0)  # [1,H,W]
-            boundary = augmented['masks'][1].unsqueeze(0)  # [1,H,W]
 
-        return image, mask, boundary
+train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=2, pin_memory=True)
 
-# ========================================
-# 4. 数据增强 + 加载器（保持不变，所有变体共享数据）
-# ========================================
-train_transform = A.Compose([
-    A.Resize(512, 512),
-    A.HorizontalFlip(),
-    A.VerticalFlip(),
-    A.Rotate(limit=20),
-    A.RandomBrightnessContrast(),
-    A.GaussNoise(),
-    A.Normalize(),
-    ToTensorV2()
-])
+print(f"训练样本数: {len(train_ds)}, 验证样本数: {len(val_ds)}")
 
-val_transform = A.Compose([
-    A.Resize(512, 512),
-    A.Normalize(),
-    ToTensorV2()
-])
-
-# 划分训练/验证（固定随机种子，确保所有变体数据划分一致）
-dataset = BUSIDataset(DATA_DIR, transform=train_transform)
-val_size = int(0.1 * len(dataset))
-train_size = len(dataset) - val_size
-train_dataset, val_dataset = torch.utils.data.random_split(
-    dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)  # 固定种子
-)
-val_dataset.dataset.transform = val_transform
-
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2)
-val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=2)
-
-print(f"训练样本数: {len(train_dataset)}, 验证样本数: {len(val_dataset)}")
 
 # ========================================
-# 5. 消融实验：修复后的模型变体（核心修改部分）
+# 4. 模型变体定义 (LBA-Net及其消融变体)
 # ========================================
-# 基础组件（保持不变）
+# 基础组件 (与主脚本同步)
 class ECABlock(nn.Module):
     def __init__(self, channels, k=3):
         super().__init__()
@@ -160,242 +179,28 @@ class LBA_Block(nn.Module):
         s = self.spatial(x)
         return self.alpha * c + self.beta * s
 
-# ------------------------------
-# 变体1：Baseline（完整LBA-Net，修复尺寸匹配）
-# ------------------------------
-class LBANet_Baseline(nn.Module):
-    def __init__(self, num_classes=1):
+# 解码器块 (与主脚本同步)
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, use_lba=True):
         super().__init__()
-        # 1. 加载MobileNetV3-Small编码器，获取特征图通道和尺度
-        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
-        self.enc_feats = self.encoder.feature_info  # 包含特征图尺度和通道信息
-        enc_channels = self.enc_feats.channels()  # [16, 24, 40, 112, 960]（对应尺度：256,128,64,32,16）
-
-        # 2. ASPP瓶颈层（输入：编码器最后一层16×16，输出256通道）
-        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
-
-        # 3. 解码器：补充1次上采样（从256×256→512×512），确保输出尺寸匹配
-        # 上采样块：ConvTranspose2d（步长2，将尺寸扩大2倍）
-        self.up4 = self._up_block(256, enc_channels[3])  # 16×16→32×32（匹配f3尺度32×32）
-        self.att4 = LBA_Block(enc_channels[3])
-        self.up3 = self._up_block(enc_channels[3], enc_channels[2])  # 32×32→64×64（匹配f2尺度64×64）
-        self.att3 = LBA_Block(enc_channels[2])
-        self.up2 = self._up_block(enc_channels[2], enc_channels[1])  # 64×64→128×128（匹配f1尺度128×128）
-        self.att2 = LBA_Block(enc_channels[1])
-        self.up1 = self._up_block(enc_channels[1], enc_channels[0])  # 128×128→256×256（匹配f0尺度256×256）
-        self.att1 = LBA_Block(enc_channels[0])
-        # 新增：最终上采样（256×256→512×512，与输入尺寸一致）
-        self.final_up = self._up_block(enc_channels[0], enc_channels[0])
-
-        # 4. 双头部输出（输入：最终上采样后的512×512特征图）
-        self.seg_head = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
-        self.boundary_head = nn.Conv2d(enc_channels[0], 1, kernel_size=1)
-
-    def _up_block(self, in_c, out_c):
-        """上采样块：ConvTranspose2d（步长2）+ BN + ReLU（确保尺寸扩大2倍）"""
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0),  # 步长2→尺寸×2
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
         )
+        self.use_lba = use_lba
+        if use_lba:
+            self.lba = LBA_Block(out_ch)
 
-    def forward(self, x):
-        # 1. 编码器提取多尺度特征（f0:256×256, f1:128×128, f2:64×64, f3:32×32, f4:16×16）
-        feats = self.encoder(x)  # feats[0]→f0, feats[1]→f1, feats[2]→f2, feats[3]→f3, feats[4]→f4
-        f0, f1, f2, f3, f4 = feats[0], feats[1], feats[2], feats[3], feats[4]
+    def forward(self, x, skip=None):
+        x = self.up(x)
+        if skip is not None:
+            x = torch.cat([x, skip], dim=1)
+        return self.lba(self.conv(x))
 
-        # 2. ASPP瓶颈处理（f4:16×16→256通道→保持16×16）
-        bottleneck = self.aspp(f4)
-
-        # 3. 解码器：逐步上采样+特征融合（确保每步尺寸匹配）
-        d4 = self.up4(bottleneck)  # 16×16→32×32（匹配f3尺寸）
-        d4 = d4 + f3  # 特征融合（上采样结果 + 编码器对应层特征）
-        d4 = self.att4(d4)  # LBA-Block增强
-
-        d3 = self.up3(d4)  # 32×32→64×64（匹配f2尺寸）
-        d3 = d3 + f2
-        d3 = self.att3(d3)
-
-        d2 = self.up2(d3)  # 64×64→128×128（匹配f1尺寸）
-        d2 = d2 + f1
-        d2 = self.att2(d2)
-
-        d1 = self.up1(d2)  # 128×128→256×256（匹配f0尺寸）
-        d1 = d1 + f0
-        d1 = self.att1(d1)
-
-        # 4. 最终上采样（256×256→512×512，与输入/标签尺寸一致）
-        final_feat = self.final_up(d1)  # 256×256→512×512
-
-        # 5. 双头部输出（512×512）
-        seg = torch.sigmoid(self.seg_head(final_feat))
-        boundary = torch.sigmoid(self.boundary_head(final_feat))
-        return seg, boundary  # 输出尺寸：[B,1,512,512]，与标签匹配
-
-# ------------------------------
-# 变体2：w/o LBA-Block（修复尺寸匹配）
-# ------------------------------
-class LBANet_NoLBA(nn.Module):
-    def __init__(self, num_classes=1):
-        super().__init__()
-        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
-        enc_channels = self.encoder.feature_info.channels()
-
-        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
-        # 解码器结构与Baseline一致，仅替换LBA-Block为1×1卷积
-        self.up4 = self._up_block(256, enc_channels[3])
-        self.up3 = self._up_block(enc_channels[3], enc_channels[2])
-        self.up2 = self._up_block(enc_channels[2], enc_channels[1])
-        self.up1 = self._up_block(enc_channels[1], enc_channels[0])
-        self.final_up = self._up_block(enc_channels[0], enc_channels[0])
-
-        # 移除LBA-Block，用1×1卷积保持通道一致性
-        self.no_att = lambda c: nn.Conv2d(c, c, kernel_size=1, bias=False)
-        self.att4 = self.no_att(enc_channels[3])
-        self.att3 = self.no_att(enc_channels[2])
-        self.att2 = self.no_att(enc_channels[1])
-        self.att1 = self.no_att(enc_channels[0])
-
-        self.seg_head = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
-        self.boundary_head = nn.Conv2d(enc_channels[0], 1, kernel_size=1)
-
-    def _up_block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        feats = self.encoder(x)
-        f0, f1, f2, f3, f4 = feats[0], feats[1], feats[2], feats[3], feats[4]
-        bottleneck = self.aspp(f4)
-
-        # 解码器流程与Baseline一致
-        d4 = self.up4(bottleneck) + f3
-        d4 = self.att4(d4)
-        d3 = self.up3(d4) + f2
-        d3 = self.att3(d3)
-        d2 = self.up2(d3) + f1
-        d2 = self.att2(d2)
-        d1 = self.up1(d2) + f0
-        d1 = self.att1(d1)
-        final_feat = self.final_up(d1)  # 关键：最终上采样到512×512
-
-        seg = torch.sigmoid(self.seg_head(final_feat))
-        boundary = torch.sigmoid(self.boundary_head(final_feat))
-        return seg, boundary
-
-# ------------------------------
-# 变体3：w/o ASPP（修复尺寸匹配）
-# ------------------------------
-class LBANet_NoASPP(nn.Module):
-    def __init__(self, num_classes=1):
-        super().__init__()
-        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
-        enc_channels = self.encoder.feature_info.channels()
-
-        # 用1×1卷积替代ASPP（保持16×16尺度）
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(enc_channels[-1], 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-
-        # 解码器结构与Baseline一致
-        self.up4 = self._up_block(256, enc_channels[3])
-        self.att4 = LBA_Block(enc_channels[3])
-        self.up3 = self._up_block(enc_channels[3], enc_channels[2])
-        self.att3 = LBA_Block(enc_channels[2])
-        self.up2 = self._up_block(enc_channels[2], enc_channels[1])
-        self.att2 = LBA_Block(enc_channels[1])
-        self.up1 = self._up_block(enc_channels[1], enc_channels[0])
-        self.att1 = LBA_Block(enc_channels[0])
-        self.final_up = self._up_block(enc_channels[0], enc_channels[0])
-
-        self.seg_head = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
-        self.boundary_head = nn.Conv2d(enc_channels[0], 1, kernel_size=1)
-
-    def _up_block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        feats = self.encoder(x)
-        f0, f1, f2, f3, f4 = feats[0], feats[1], feats[2], feats[3], feats[4]
-        bottleneck = self.bottleneck(f4)  # 替代ASPP，保持16×16尺度
-
-        # 解码器流程与Baseline一致，最终上采样到512×512
-        d4 = self.up4(bottleneck) + f3
-        d4 = self.att4(d4)
-        d3 = self.up3(d4) + f2
-        d3 = self.att3(d3)
-        d2 = self.up2(d3) + f1
-        d2 = self.att2(d2)
-        d1 = self.up1(d2) + f0
-        d1 = self.att1(d1)
-        final_feat = self.final_up(d1)
-
-        seg = torch.sigmoid(self.seg_head(final_feat))
-        boundary = torch.sigmoid(self.boundary_head(final_feat))
-        return seg, boundary
-
-# ------------------------------
-# 变体4：w/o Boundary Head（修复尺寸匹配）
-# ------------------------------
-class LBANet_NoBoundary(nn.Module):
-    def __init__(self, num_classes=1):
-        super().__init__()
-        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
-        enc_channels = self.encoder.feature_info.channels()
-
-        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
-        # 解码器结构与Baseline一致
-        self.up4 = self._up_block(256, enc_channels[3])
-        self.att4 = LBA_Block(enc_channels[3])
-        self.up3 = self._up_block(enc_channels[3], enc_channels[2])
-        self.att3 = LBA_Block(enc_channels[2])
-        self.up2 = self._up_block(enc_channels[2], enc_channels[1])
-        self.att2 = LBA_Block(enc_channels[1])
-        self.up1 = self._up_block(enc_channels[1], enc_channels[0])
-        self.att1 = LBA_Block(enc_channels[0])
-        self.final_up = self._up_block(enc_channels[0], enc_channels[0])
-
-        # 仅保留分割头
-        self.seg_head = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
-
-    def _up_block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        feats = self.encoder(x)
-        f0, f1, f2, f3, f4 = feats[0], feats[1], feats[2], feats[3], feats[4]
-        bottleneck = self.aspp(f4)
-
-        # 解码器流程与Baseline一致，最终上采样到512×512
-        d4 = self.up4(bottleneck) + f3
-        d4 = self.att4(d4)
-        d3 = self.up3(d4) + f2
-        d3 = self.att3(d3)
-        d2 = self.up2(d3) + f1
-        d2 = self.att2(d2)
-        d1 = self.up1(d2) + f0
-        d1 = self.att1(d1)
-        final_feat = self.final_up(d1)
-
-        seg = torch.sigmoid(self.seg_head(final_feat))
-        return seg  # 输出尺寸：[B,1,512,512]，与标签匹配
-
-# ------------------------------
-# 变体5：LBA→CBAM（修复尺寸匹配）
-# ------------------------------
+# CBAM (用于变体4)
 class CBAM(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
@@ -423,6 +228,187 @@ class CBAM(nn.Module):
         x = x * spatial_att
         return x
 
+
+# ------------------------------
+# 变体0: Baseline (完整LBA-Net)
+# ------------------------------
+class LBANet_Baseline(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
+        enc_channels = self.encoder.feature_info.channels() # [16, 24, 40, 112, 960]
+
+        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
+
+        self.up4 = DecoderBlock(256, enc_channels[3], enc_channels[3], use_lba=True) # 1/32 -> 1/16
+        self.up3 = DecoderBlock(enc_channels[3], enc_channels[2], enc_channels[2], use_lba=True) # 1/16 -> 1/8
+        self.up2 = DecoderBlock(enc_channels[2], enc_channels[1], enc_channels[1], use_lba=True) # 1/8 -> 1/4
+        self.up1 = DecoderBlock(enc_channels[1], enc_channels[0], enc_channels[0], use_lba=True) # 1/4 -> 1/2
+
+        # Final upsampling to match input size (512x512)
+        self.final_up_conv = nn.Sequential(
+             nn.ConvTranspose2d(enc_channels[0], 64, kernel_size=2, stride=2), # 1/2 -> 1/1
+             nn.BatchNorm2d(64),
+             nn.ReLU(inplace=True)
+        )
+
+
+        self.seg_head = nn.Conv2d(64, num_classes, kernel_size=1)
+        self.boundary_head = nn.Conv2d(64, 1, kernel_size=1)
+
+
+    def forward(self, x):
+        feats = self.encoder(x) # f0: 1/2, f1: 1/4, f2: 1/8, f3: 1/16, f4: 1/32
+        f0, f1, f2, f3, f4 = feats
+
+        bottleneck = self.aspp(f4) # 1/32
+
+        d4 = self.up4(bottleneck, f3) # 1/32 -> 1/16, fuse f3
+        d3 = self.up3(d4, f2)       # 1/16 -> 1/8, fuse f2
+        d2 = self.up2(d3, f1)       # 1/8 -> 1/4, fuse f1
+        d1 = self.up1(d2, f0)       # 1/4 -> 1/2, fuse f0
+
+        final_feat = self.final_up_conv(d1) # 1/2 -> 1/1 (512x512)
+
+        seg = torch.sigmoid(self.seg_head(final_feat))
+        boundary = torch.sigmoid(self.boundary_head(final_feat))
+        return seg, boundary
+
+# ------------------------------
+# 变体1: w/o LBA-Block
+# ------------------------------
+class LBANet_NoLBA(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
+        enc_channels = self.encoder.feature_info.channels()
+
+        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
+
+        # Decoder blocks without LBA
+        self.up4 = DecoderBlock(256, enc_channels[3], enc_channels[3], use_lba=False)
+        self.up3 = DecoderBlock(enc_channels[3], enc_channels[2], enc_channels[2], use_lba=False)
+        self.up2 = DecoderBlock(enc_channels[2], enc_channels[1], enc_channels[1], use_lba=False)
+        self.up1 = DecoderBlock(enc_channels[1], enc_channels[0], enc_channels[0], use_lba=False)
+
+        self.final_up_conv = nn.Sequential(
+             nn.ConvTranspose2d(enc_channels[0], 64, kernel_size=2, stride=2), # 1/2 -> 1/1
+             nn.BatchNorm2d(64),
+             nn.ReLU(inplace=True)
+        )
+
+        self.seg_head = nn.Conv2d(64, num_classes, kernel_size=1)
+        self.boundary_head = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        feats = self.encoder(x)
+        f0, f1, f2, f3, f4 = feats
+
+        bottleneck = self.aspp(f4)
+
+        d4 = self.up4(bottleneck, f3)
+        d3 = self.up3(d4, f2)
+        d2 = self.up2(d3, f1)
+        d1 = self.up1(d2, f0)
+
+        final_feat = self.final_up_conv(d1)
+
+        seg = torch.sigmoid(self.seg_head(final_feat))
+        boundary = torch.sigmoid(self.boundary_head(final_feat))
+        return seg, boundary
+
+# ------------------------------
+# 变体2: w/o ASPP
+# ------------------------------
+class LBANet_NoASPP(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
+        enc_channels = self.encoder.feature_info.channels()
+
+        # Replace ASPP with a simple 1x1 conv + BN + ReLU
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(enc_channels[-1], 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+
+        self.up4 = DecoderBlock(256, enc_channels[3], enc_channels[3], use_lba=True)
+        self.up3 = DecoderBlock(enc_channels[3], enc_channels[2], enc_channels[2], use_lba=True)
+        self.up2 = DecoderBlock(enc_channels[2], enc_channels[1], enc_channels[1], use_lba=True)
+        self.up1 = DecoderBlock(enc_channels[1], enc_channels[0], enc_channels[0], use_lba=True)
+
+        self.final_up_conv = nn.Sequential(
+             nn.ConvTranspose2d(enc_channels[0], 64, kernel_size=2, stride=2), # 1/2 -> 1/1
+             nn.BatchNorm2d(64),
+             nn.ReLU(inplace=True)
+        )
+
+        self.seg_head = nn.Conv2d(64, num_classes, kernel_size=1)
+        self.boundary_head = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        feats = self.encoder(x)
+        f0, f1, f2, f3, f4 = feats
+
+        bottleneck = self.bottleneck(f4) # Replace ASPP
+
+        d4 = self.up4(bottleneck, f3)
+        d3 = self.up3(d4, f2)
+        d2 = self.up2(d3, f1)
+        d1 = self.up1(d2, f0)
+
+        final_feat = self.final_up_conv(d1)
+
+        seg = torch.sigmoid(self.seg_head(final_feat))
+        boundary = torch.sigmoid(self.boundary_head(final_feat))
+        return seg, boundary
+
+# ------------------------------
+# 变体3: w/o Boundary Head
+# ------------------------------
+class LBANet_NoBoundary(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = timm.create_model("mobilenetv3_small_100", pretrained=True, features_only=True)
+        enc_channels = self.encoder.feature_info.channels()
+
+        self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
+
+        self.up4 = DecoderBlock(256, enc_channels[3], enc_channels[3], use_lba=True)
+        self.up3 = DecoderBlock(enc_channels[3], enc_channels[2], enc_channels[2], use_lba=True)
+        self.up2 = DecoderBlock(enc_channels[2], enc_channels[1], enc_channels[1], use_lba=True)
+        self.up1 = DecoderBlock(enc_channels[1], enc_channels[0], enc_channels[0], use_lba=True)
+
+        self.final_up_conv = nn.Sequential(
+             nn.ConvTranspose2d(enc_channels[0], 64, kernel_size=2, stride=2), # 1/2 -> 1/1
+             nn.BatchNorm2d(64),
+             nn.ReLU(inplace=True)
+        )
+
+        # Only Segmentation Head
+        self.seg_head = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        feats = self.encoder(x)
+        f0, f1, f2, f3, f4 = feats
+
+        bottleneck = self.aspp(f4)
+
+        d4 = self.up4(bottleneck, f3)
+        d3 = self.up3(d4, f2)
+        d2 = self.up2(d3, f1)
+        d1 = self.up1(d2, f0)
+
+        final_feat = self.final_up_conv(d1)
+
+        seg = torch.sigmoid(self.seg_head(final_feat))
+        # Return only segmentation output
+        return seg
+
+# ------------------------------
+# 变体4: LBA -> CBAM
+# ------------------------------
 class LBANet_CBAM(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
@@ -430,48 +416,50 @@ class LBANet_CBAM(nn.Module):
         enc_channels = self.encoder.feature_info.channels()
 
         self.aspp = torchvision.models.segmentation.deeplabv3.DeepLabHead(enc_channels[-1], 256)
-        # 解码器结构与Baseline一致，仅替换LBA-Block为CBAM
-        self.up4 = self._up_block(256, enc_channels[3])
-        self.att4 = CBAM(enc_channels[3])
-        self.up3 = self._up_block(enc_channels[3], enc_channels[2])
-        self.att3 = CBAM(enc_channels[2])
-        self.up2 = self._up_block(enc_channels[2], enc_channels[1])
-        self.att2 = CBAM(enc_channels[1])
-        self.up1 = self._up_block(enc_channels[1], enc_channels[0])
-        self.att1 = CBAM(enc_channels[0])
-        self.final_up = self._up_block(enc_channels[0], enc_channels[0])
 
-        self.seg_head = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
-        self.boundary_head = nn.Conv2d(enc_channels[0], 1, kernel_size=1)
+        # Decoder blocks with CBAM instead of LBA
+        self.up4 = DecoderBlock(256, enc_channels[3], enc_channels[3], use_lba=False) # Use DecoderBlock without LBA
+        self.cbam4 = CBAM(enc_channels[3]) # Add CBAM after DecoderBlock
+        self.up3 = DecoderBlock(enc_channels[3], enc_channels[2], enc_channels[2], use_lba=False)
+        self.cbam3 = CBAM(enc_channels[2])
+        self.up2 = DecoderBlock(enc_channels[2], enc_channels[1], enc_channels[1], use_lba=False)
+        self.cbam2 = CBAM(enc_channels[1])
+        self.up1 = DecoderBlock(enc_channels[1], enc_channels[0], enc_channels[0], use_lba=False)
+        self.cbam1 = CBAM(enc_channels[0])
 
-    def _up_block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
+        self.final_up_conv = nn.Sequential(
+             nn.ConvTranspose2d(enc_channels[0], 64, kernel_size=2, stride=2), # 1/2 -> 1/1
+             nn.BatchNorm2d(64),
+             nn.ReLU(inplace=True)
         )
+
+        self.seg_head = nn.Conv2d(64, num_classes, kernel_size=1)
+        self.boundary_head = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x):
         feats = self.encoder(x)
-        f0, f1, f2, f3, f4 = feats[0], feats[1], feats[2], feats[3], feats[4]
+        f0, f1, f2, f3, f4 = feats
+
         bottleneck = self.aspp(f4)
 
-        # 解码器流程与Baseline一致，最终上采样到512×512
-        d4 = self.up4(bottleneck) + f3
-        d4 = self.att4(d4)
-        d3 = self.up3(d4) + f2
-        d3 = self.att3(d3)
-        d2 = self.up2(d3) + f1
-        d2 = self.att2(d2)
-        d1 = self.up1(d2) + f0
-        d1 = self.att1(d1)
-        final_feat = self.final_up(d1)
+        d4 = self.up4(bottleneck, f3)
+        d4 = self.cbam4(d4) # Apply CBAM
+        d3 = self.up3(d4, f2)
+        d3 = self.cbam3(d3)
+        d2 = self.up2(d3, f1)
+        d2 = self.cbam2(d2)
+        d1 = self.up1(d2, f0)
+        d1 = self.cbam1(d1)
+
+        final_feat = self.final_up_conv(d1)
 
         seg = torch.sigmoid(self.seg_head(final_feat))
         boundary = torch.sigmoid(self.boundary_head(final_feat))
         return seg, boundary
+
+
 # ========================================
-# 6. 损失函数 + 评估指标（适配所有变体）
+# 5. 损失函数 + 评估指标 (适配所有变体)
 # ========================================
 def dice_loss(pred, target, eps=1e-6):
     intersection = (pred * target).sum(dim=(2,3))
@@ -489,13 +477,29 @@ def tversky_loss(pred, target, alpha=0.7, beta=0.3, eps=1e-6):
     tversky = (TP + eps) / (TP + alpha*FP + beta*FN + eps)
     return 1 - tversky
 
-def total_loss(seg_pred, seg_gt, boundary_pred=None, boundary_gt=None, lam=0.5, has_boundary=True):
+def total_loss(seg_pred, seg_gt, boundary_pred=None, boundary_gt=None, lam=0.3, has_boundary=True):
     """适配有无边界头的变体：has_boundary=False时仅计算分割损失"""
     seg_loss = bce_loss(seg_pred, seg_gt) + dice_loss(seg_pred, seg_gt)
     if not has_boundary:
         return seg_loss
-    boundary_loss = tversky_loss(boundary_pred, boundary_gt)
+    # Generate boundary GT if not provided for this batch (only for models with boundary head)
+    if boundary_gt is None:
+         boundary_gt = generate_boundary_gt(seg_gt)
+
+    boundary_loss = tversky_loss(torch.sigmoid(boundary_pred), boundary_gt) # Apply sigmoid here
     return seg_loss + lam * boundary_loss
+
+def generate_boundary_gt(mask):
+    """Generate boundary ground truth from mask"""
+    b, c, h, w = mask.shape
+    batch_bdy = []
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    for i in range(b):
+        m_np = (mask[i,0].cpu().numpy()*255).astype(np.uint8)
+        bdy_np = cv2.morphologyEx(m_np, cv2.MORPH_GRADIENT, kernel)
+        batch_bdy.append((bdy_np / 255.0).astype(np.float32))
+    return torch.from_numpy(np.stack(batch_bdy, axis=0)).unsqueeze(1).to(mask.device)
+
 
 def calculate_metrics(pred, target, threshold=0.5):
     """计算Dice、IoU（评估核心指标）"""
@@ -509,35 +513,99 @@ def calculate_metrics(pred, target, threshold=0.5):
 
 def count_params_flops(model, input_size=(3,512,512)):
     """统计模型参数（M）和FLOPs（G）"""
-    from thop import profile
-    device = next(model.parameters()).device
+    # Ensure the model is on the correct device before profiling
+    original_device = next(model.parameters()).device
+    model.to(device)
     input_tensor = torch.randn(1, *input_size).to(device)
-    flops, params = profile(model, inputs=(input_tensor,))
+
+    # Need to handle models with different output shapes (like NoBoundary)
+    # Profile the part of the model that is common or adjust based on variant
+    # For simplicity, we will profile the full forward pass and note differences for NoBoundary
+    if isinstance(model, LBANet_NoBoundary):
+         # Profile the forward pass up to the segmentation head
+         # This is an approximation; a more precise way would be to profile submodules
+         # Or define a custom profiler for each variant.
+         # For now, we'll just profile the whole thing and acknowledge the bdy_head FLOPs are small
+         # and params are zero for NoBoundary variant.
+         flops, params = profile(model, inputs=(input_tensor,), verbose=False)
+
+    elif isinstance(model, (LBANet_Baseline, LBANet_NoLBA, LBANet_NoASPP, LBANet_CBAM)):
+         flops, params = profile(model, inputs=(input_tensor,), verbose=False)
+    else:
+         # Fallback for other potential model types
+         flops, params = profile(model, inputs=(input_tensor,), verbose=False)
+
+
+    # Move model back to original device if necessary
+    model.to(original_device)
+
     return params / 1e6, flops / 1e9  # 转换为百万和十亿
 
+def calculate_inference_fps(model, input_size=(3, 512, 512), num_runs=100):
+    """计算推理FPS"""
+    model.eval()
+    input_tensor = torch.randn(1, *input_size).to(device)
+
+    # Warm-up
+    with torch.no_grad():
+        for _ in range(10):
+            model(input_tensor)
+
+    # Measure time
+    torch.cuda.synchronize() # Ensure CUDA operations are finished
+    start_time = time.time()
+    with torch.no_grad():
+        for _ in range(num_runs):
+            model(input_tensor)
+    torch.cuda.synchronize() # Ensure CUDA operations are finished
+    end_time = time.time()
+
+    fps = num_runs / (end_time - start_time)
+    return round(fps, 1)
+
+
 # ========================================
-# 7. 消融实验：统一训练与评估函数（所有变体共享）
+# 6. 消融实验：统一训练与评估函数
 # ========================================
-def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
+def train_evaluate_model(model_name, model_class, train_loader, val_loader, has_boundary=True, epochs=80):
     """
     训练并评估单个消融变体
     model_name: 变体名称（用于记录）
     model_class: 模型类（如LBANet_Baseline）
-    has_boundary: 是否有边界头（适配变体4）
-    epochs: 训练轮次（原代码20，建议改为50+以稳定收敛）
+    train_loader, val_loader: 数据加载器
+    has_boundary: 是否有边界头（适配变体3）
+    epochs: 训练轮次
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model_class().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # 记录训练过程
+    # Separate learning rates for encoder and others
+    optimizer = torch.optim.AdamW([
+        {'params': model.encoder.parameters(), 'lr': 1e-5},
+        {'params': [p for n, p in model.named_parameters() if 'encoder' not in n], 'lr': 1e-4}
+    ], weight_decay=1e-5)
+
+    # Using ReduceLROnPlateau scheduler based on validation loss
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    old_lr = optimizer.param_groups[0]['lr']
+    scheduler.step(val_loss)
+    new_lr = optimizer.param_groups[0]['lr']
+    if new_lr != old_lr:
+      print(f"Epoch {epoch+1}: lr adjusted to {new_lr}")
+
+
+    # Record training progress
     train_losses = []
     val_losses = []
     val_dices = []
     val_ious = []
     best_val_dice = 0.0
     best_model_path = os.path.join(SAVE_DIR, f"{model_name}_best.pth")
+    early_stop_patience = 20 # Patience for early stopping
+    early_stop_counter = 0
+
+
+    print(f"\n开始训练：{model_name}")
+    print("-" * 30)
 
     for epoch in range(epochs):
         # ------------------------------
@@ -545,13 +613,14 @@ def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
         # ------------------------------
         model.train()
         epoch_train_loss = 0.0
-        for imgs, masks, boundaries in train_loader:
-            imgs, masks, boundaries = imgs.to(device), masks.to(device), boundaries.to(device)
+        train_loop = tqdm(train_loader, leave=False, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        for imgs, masks in train_loop:
+            imgs, masks = imgs.to(device), masks.to(device)
 
             optimizer.zero_grad()
             if has_boundary:
                 seg_pred, boundary_pred = model(imgs)
-                loss = total_loss(seg_pred, masks, boundary_pred, boundaries, has_boundary=True)
+                loss = total_loss(seg_pred, masks, boundary_pred=boundary_pred, has_boundary=True)
             else:
                 seg_pred = model(imgs)
                 loss = total_loss(seg_pred, masks, has_boundary=False)
@@ -559,6 +628,9 @@ def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
             loss.backward()
             optimizer.step()
             epoch_train_loss += loss.item()
+
+            train_loop.set_postfix(loss=loss.item())
+
 
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
@@ -570,24 +642,28 @@ def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
         epoch_val_loss = 0.0
         epoch_val_dice = 0.0
         epoch_val_iou = 0.0
+        val_loop = tqdm(val_loader, leave=False, desc=f"Epoch {epoch+1}/{epochs} [Val]")
         with torch.no_grad():
-            for imgs, masks, boundaries in val_loader:
-                imgs, masks, boundaries = imgs.to(device), masks.to(device), boundaries.to(device)
+            for imgs, masks in val_loop:
+                imgs, masks = imgs.to(device), masks.to(device)
 
                 if has_boundary:
                     seg_pred, boundary_pred = model(imgs)
-                    loss = total_loss(seg_pred, masks, boundary_pred, boundaries, has_boundary=True)
+                    loss = total_loss(seg_pred, masks, boundary_pred=boundary_pred, has_boundary=True)
                 else:
                     seg_pred = model(imgs)
                     loss = total_loss(seg_pred, masks, has_boundary=False)
 
-                # 计算指标
+                # Calculate metrics
                 dice, iou = calculate_metrics(seg_pred, masks)
                 epoch_val_loss += loss.item()
                 epoch_val_dice += dice
                 epoch_val_iou += iou
 
-        # 平均验证指标
+                val_loop.set_postfix(loss=loss.item(), dice=dice, iou=iou)
+
+
+        # Average validation metrics
         avg_val_loss = epoch_val_loss / len(val_loader)
         avg_val_dice = epoch_val_dice / len(val_loader)
         avg_val_iou = epoch_val_iou / len(val_loader)
@@ -595,47 +671,66 @@ def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
         val_dices.append(avg_val_dice)
         val_ious.append(avg_val_iou)
 
-        # 保存最优模型
+        # Update learning rate based on validation loss
+        scheduler.step(avg_val_loss)
+
+        # Check for best model and early stopping
         if avg_val_dice > best_val_dice:
             best_val_dice = avg_val_dice
             torch.save(model.state_dict(), best_model_path)
+            early_stop_counter = 0 # Reset patience
+            print(f"\nEpoch {epoch+1:3d} | Saved best model with Val Dice: {best_val_dice:.4f}")
+        else:
+            early_stop_counter += 1
 
-        # 更新学习率
-        scheduler.step()
+        # Print epoch summary
+        print(f"Epoch {epoch+1:3d}/{epochs} | "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f} | "
+              f"Val Dice: {avg_val_dice:.4f} | "
+              f"Val IoU: {avg_val_iou:.4f}")
 
-        # 打印日志
-        print(f"[{model_name}] Epoch {epoch+1:2d}/{epochs}: "
-              f"Train Loss={avg_train_loss:.4f}, "
-              f"Val Loss={avg_val_loss:.4f}, "
-              f"Val Dice={avg_val_dice:.4f}, "
-              f"Val IoU={avg_val_iou:.4f}, "
-              f"Best Dice={best_val_dice:.4f}")
+        # Check early stopping condition
+        if early_stop_counter >= early_stop_patience:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            break
+
 
     # ------------------------------
-    # 最终评估（加载最优模型）
+    # Final Evaluation (Load best model)
     # ------------------------------
-    model.load_state_dict(torch.load(best_model_path))
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        print(f"\nLoaded best model for {model_name} for final evaluation.")
+    else:
+        print(f"\nWarning: Best model checkpoint not found for {model_name}. Using last epoch's model for final evaluation.")
+
     model.eval()
     final_val_dice = 0.0
     final_val_iou = 0.0
+    final_eval_loop = tqdm(val_loader, leave=False, desc=f"Final Evaluation [{model_name}]")
     with torch.no_grad():
-        for imgs, masks, _ in val_loader:
+        for imgs, masks in final_eval_loop:
             imgs, masks = imgs.to(device), masks.to(device)
             if has_boundary:
                 seg_pred, _ = model(imgs)
             else:
                 seg_pred = model(imgs)
             dice, iou = calculate_metrics(seg_pred, masks)
-            final_val_dice += dice
-            final_val_iou += iou
-    final_val_dice /= len(val_loader)
-    final_val_iou /= len(val_loader)
+            final_val_dice += dice * imgs.size(0)
+            final_val_iou += iou * imgs.size(0)
 
-    # 统计效率指标（参数、FLOPs）
+    final_val_dice /= len(val_loader.dataset)
+    final_val_iou /= len(val_loader.dataset)
+
+    # Calculate efficiency metrics (Params, FLOPs, FPS)
+    # Note: FPS calculation includes moving model to/from CPU/GPU if needed
     params, flops = count_params_flops(model)
+    fps = calculate_inference_fps(model)
+
 
     # ------------------------------
-    # 保存结果
+    # Save results
     # ------------------------------
     result = {
         "Model Name": model_name,
@@ -646,21 +741,24 @@ def train_evaluate_model(model_name, model_class, has_boundary=True, epochs=50):
         "Best Val Dice (%)": round(best_val_dice * 100, 2),
         "Train Losses": train_losses,
         "Val Losses": val_losses,
-        "Val Dices": val_dices
+        "Val Dices": val_dices,
+        "Val IoUs": val_ious,
+        "FPS": fps
     }
 
-    print(f"\n[{model_name}] 最终结果: "
+    print(f"\n[{model_name}] 最终评估结果: "
           f"Dice={final_val_dice:.2%}, "
           f"IoU={final_val_iou:.2%}, "
           f"Params={params:.2f}M, "
-          f"FLOPs={flops:.2f}G\n")
+          f"FLOPs={flops:.2f}G, "
+          f"FPS={fps:.1f}\n")
 
     return result
 
 # ========================================
-# 8. 执行消融实验：训练所有变体
+# 7. 执行消融实验：训练所有变体
 # ========================================
-# 定义所有消融变体（顺序：基准→逐步移除/替换）
+# Define all ablation variants
 ablation_variants = [
     ("Baseline (Full LBA-Net)", LBANet_Baseline, True),  # 基准
     ("V1 (w/o LBA-Block)", LBANet_NoLBA, True),          # 无LBA
@@ -669,72 +767,84 @@ ablation_variants = [
     ("V4 (LBA→CBAM)", LBANet_CBAM, True)                 # LBA换CBAM
 ]
 
-# 批量训练并收集结果（建议分批次运行，避免Colab会话超时）
+# Batch train and collect results
 ablation_results = []
+# You might want to run these one by one in Colab to manage memory and time
+# For a full run, uncomment the loop below:
 for model_name, model_class, has_boundary in ablation_variants:
-    print("="*50)
-    print(f"开始训练：{model_name}")
-    print("="*50)
-    result = train_evaluate_model(model_name, model_class, has_boundary, epochs=50)
-    ablation_results.append(result)
+     result = train_evaluate_model(model_name, model_class, train_loader, val_loader, has_boundary, epochs=80) # Reduced epochs for faster test
+     ablation_results.append(result)
+
 
 # ========================================
-# 9. 消融实验结果可视化：表格 + 曲线
+# 8. 消融实验结果可视化：表格 + 曲线
 # ========================================
 # ------------------------------
-# 9.1 生成结果表格（保存为CSV+美化显示）
+# 8.1 生成结果表格
 # ------------------------------
-# 提取关键指标（排除训练曲线）
+# Extract key metrics
 table_data = []
 for res in ablation_results:
     table_data.append({
         "Model Variant": res["Model Name"],
-        "Val Dice (%)": res["Final Val Dice (%)"],
-        "Val IoU (%)": res["Final Val IoU (%)"],
+        "Final Val Dice (%)": res["Final Val Dice (%)"],
+        "Final Val IoU (%)": res["Final Val IoU (%)"],
         "Params (M)": res["Params (M)"],
         "FLOPs (G)": res["FLOPs (G)"],
+        "FPS (GPU)": res["FPS"],
         "Best Val Dice (%)": res["Best Val Dice (%)"]
     })
 
-# 转换为DataFrame并保存
+# Convert to DataFrame and save
 df_ablation = pd.DataFrame(table_data)
-df_ablation = df_ablation.sort_values("Val Dice (%)", ascending=False)  # 按Dice降序
+df_ablation = df_ablation.sort_values("Final Val Dice (%)", ascending=False)
 csv_path = os.path.join(SAVE_DIR, "ablation_results.csv")
-df_ablation.to_csv(csv_path, index=False, encoding="utf-8")
+df_ablation.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
-# 美化表格显示（加粗最优值）
+# Display styled table
 def highlight_max(s):
+    if s.dtype == np.object_: # Handle string columns
+        return [''] * len(s)
     is_max = s == s.max()
     return [f"font-weight: bold; background-color: #f0f8ff" if v else "" for v in is_max]
 
-styled_table = df_ablation.style.apply(highlight_max, subset=["Val Dice (%)", "Val IoU (%)"])
-styled_table = styled_table.set_caption("Ablation Study Results of LBA-Net")
+styled_table = df_ablation.style.apply(highlight_max, subset=["Final Val Dice (%)", "Final Val IoU (%)", "FPS (GPU)"])
+# For Params and FLOPs, lower is better, so highlight min
+def highlight_min(s):
+     if s.dtype == np.object_:
+         return [''] * len(s)
+     is_min = s == s.min()
+     return [f"font-weight: bold; background-color: #fffafa" if v else "" for v in is_min]
+
+styled_table = styled_table.apply(highlight_min, subset=["Params (M)", "FLOPs (G)"])
+
+styled_table = styled_table.set_caption("LBA-Net 消融实验结果")
 print("\n消融实验结果表格：")
 display(styled_table)
-files.download(csv_path)  # 下载到本地
+files.download(csv_path)
 
 # ------------------------------
-# 9.2 绘制训练曲线对比（Loss + Dice）
+# 8.2 绘制训练曲线对比 (Loss + Dice)
 # ------------------------------
 plt.rcParams['font.size'] = 10
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
-# 子图1：训练/验证Loss对比
+# Subplot 1: Train/Val Loss Comparison
 for res in ablation_results:
     ax1.plot(res["Train Losses"], label=f"{res['Model Name']} (Train)", linestyle="-")
     ax1.plot(res["Val Losses"], label=f"{res['Model Name']} (Val)", linestyle="--")
 ax1.set_xlabel("Epoch")
 ax1.set_ylabel("Loss")
-ax1.set_title("Train/Val Loss Comparison")
+ax1.set_title("训练/验证损失对比")
 ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 ax1.grid(alpha=0.3)
 
-# 子图2：验证Dice对比
+# Subplot 2: Val Dice Comparison
 for res in ablation_results:
     ax2.plot(res["Val Dices"], label=res["Model Name"], marker="o", markersize=2)
 ax2.set_xlabel("Epoch")
-ax2.set_ylabel("Val Dice")
-ax2.set_title("Val Dice Comparison")
+ax2.set_ylabel("验证集 Dice")
+ax2.set_title("验证集 Dice 对比")
 ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 ax2.grid(alpha=0.3)
 
@@ -742,63 +852,6 @@ plt.tight_layout()
 curve_path = os.path.join(SAVE_DIR, "ablation_curves.png")
 plt.savefig(curve_path, dpi=300, bbox_inches='tight')
 plt.show()
-files.download(curve_path)  # 下载到本地
+files.download(curve_path)
 
-# ------------------------------
-# 9.3 绘制分割结果示例（对比基准与关键变体）
-# ------------------------------
-def plot_segmentation_examples(model_classes, model_names, num_examples=3):
-    """绘制多个变体的分割结果对比"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    imgs, masks, _ = next(iter(val_loader))
-    imgs, masks = imgs.to(device), masks.to(device)
-
-    # 加载每个变体的最优模型
-    models = []
-    for cls, name in zip(model_classes, model_names):
-        model = cls().to(device)
-        model.load_state_dict(torch.load(os.path.join(SAVE_DIR, f"{name}_best.pth")))
-        model.eval()
-        models.append(model)
-
-    # 生成预测
-    preds = []
-    with torch.no_grad():
-        for model, has_boundary in zip(models, [True, True, False]):  # 适配变体3
-            if has_boundary:
-                pred, _ = model(imgs)
-            else:
-                pred = model(imgs)
-            preds.append((pred > 0.5).float())
-
-    # 绘制对比图
-    for i in range(num_examples):
-        plt.figure(figsize=(18, 4))
-        # 输入图像
-        plt.subplot(1, len(models)+2, 1)
-        plt.imshow(imgs[i].permute(1,2,0).cpu().numpy())
-        plt.title("Input Image")
-        plt.axis("off")
-        # 真值
-        plt.subplot(1, len(models)+2, 2)
-        plt.imshow(masks[i][0].cpu().numpy(), cmap="gray")
-        plt.title("GT Mask")
-        plt.axis("off")
-        # 各变体预测
-        for j, (pred, name) in enumerate(zip(preds, model_names)):
-            plt.subplot(1, len(models)+2, j+3)
-            plt.imshow(pred[i][0].cpu().numpy(), cmap="gray")
-            plt.title(f"{name} (Pred)")
-            plt.axis("off")
-        plt.tight_layout()
-        example_path = os.path.join(SAVE_DIR, f"segmentation_example_{i+1}.png")
-        plt.savefig(example_path, dpi=300, bbox_inches='tight')
-        plt.show()
-        files.download(example_path)
-
-# 选择关键变体绘制（基准、无LBA、无边界头）
-plot_segmentation_examples(
-    model_classes=[LBANet_Baseline, LBANet_NoLBA, LBANet_NoBoundary],
-    model_names=["Baseline (Full LBA-Net)", "V1 (w/o LBA-Block)", "V3 (w/o Boundary Head)"],
-    num_examples=3
-)
+print("消融实验代码已生成。请运行此单元格来执行实验。")
