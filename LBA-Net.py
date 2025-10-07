@@ -6,7 +6,7 @@ for Breast Ultrasound Image Segmentation
 
 Backbone: MobileNetV3-Small
 Module: Lightweight Boundary-Aware (ECA + Spatial Attention)
-Author: Adapted for Colab experiments
+Author: Adapted
 """
 
 import torch
@@ -126,3 +126,4 @@ if __name__ == "__main__":
     x = torch.randn(1, 3, 512, 512)
     y = model(x)
     print("Output shape:", y.shape)
+
