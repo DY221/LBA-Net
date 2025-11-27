@@ -1,65 +1,700 @@
-class UNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=3, num_classes=1, deep_supervision=False):
-        super().__init__()
-        nb_filter = [32, 64, 128, 256, 512]
-        self.deep_supervision = deep_supervision
+# ================= 0. 环境 & 数据路径 =================
+# pip -q install segmentation-models-pytorch timm albumentations opencv-python thop matplotlib
+import os, cv2, random, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import timm
+from tqdm import tqdm
+import re
+from sklearn.model_selection import KFold
+from thop import profile, clever_format
+import time
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from sklearn.model_selection import KFold
+from scipy.ndimage import distance_transform_edt as edt
+from scipy.spatial.distance import directed_hausdorff
+from monai.metrics import compute_hausdorff_distance
+import matplotlib
+matplotlib.use('Agg')  # 非交互式后端，不依赖Tkinter，支持多进程
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+DATA_DIR = "/home/wang/ultrasound/BUET_BUSD-new"
+OUT_DIR = "/home/wang/ultrasound/unetplusplus-BUET"  
+os.makedirs(OUT_DIR, exist_ok=True)
 
-        self.pool = nn.MaxPool2d(2, 2)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+IMG_SIZE = 512
+BATCH_SIZE = 8
+EPOCHS = 300
+NUM_WORKERS = 4
+USE_AMP = True
 
-        self.conv0_0 = DoubleConv(in_channels, nb_filter[0])
-        self.conv1_0 = DoubleConv(nb_filter[0], nb_filter[1])
-        self.conv2_0 = DoubleConv(nb_filter[1], nb_filter[2])
-        self.conv3_0 = DoubleConv(nb_filter[2], nb_filter[3])
-        self.conv4_0 = DoubleConv(nb_filter[3], nb_filter[4])
+# ================= 1. Dataset =================
+class BUSIDataset(Dataset):
+    def __init__(self, root, split='train', img_size=512):
+        self.root = root
+        self.split = split
+        self.img_size = img_size
+        cls_list = ['benign', 'malignant']
+        self.imgs, self.masks = [], []
+        for cls in cls_list:
+            cls_dir = os.path.join(root, cls)
+            if not os.path.isdir(cls_dir): continue
 
-        self.conv0_1 = DoubleConv(nb_filter[0]+nb_filter[1], nb_filter[0])
-        self.conv1_1 = DoubleConv(nb_filter[1]+nb_filter[2], nb_filter[1])
-        self.conv2_1 = DoubleConv(nb_filter[2]+nb_filter[3], nb_filter[2])
-        self.conv3_1 = DoubleConv(nb_filter[3]+nb_filter[4], nb_filter[3])
+            # 先收集所有图像文件（排除mask文件）
+            image_files = []
+            for fname in os.listdir(cls_dir):
+                if 'mask' in fname.lower():
+                    continue  # 跳过所有mask文件
+                image_files.append(fname)
 
-        self.conv0_2 = DoubleConv(nb_filter[0]*2+nb_filter[1], nb_filter[0])
-        self.conv1_2 = DoubleConv(nb_filter[1]*2+nb_filter[2], nb_filter[1])
-        self.conv2_2 = DoubleConv(nb_filter[2]*2+nb_filter[3], nb_filter[2])
+            # 为每个图像文件处理对应的mask
+            for img_fname in image_files:
+                img_path = os.path.join(cls_dir, img_fname)
+                # 基础文件名，不带后缀
+                base_name = os.path.splitext(img_fname)[0]  # → 例如 benign (4)
+                # 扩展名（自动适配 .png/.bmp/.jpg/.jpeg/.tif）
+                ext = os.path.splitext(img_fname)[1].lower()  # 例如 ".bmp"
+                # 构造正则：匹配以下任意一种形式
+                # benign (4)_mask.png
+                # benign (4)_mask_1.png
+                # benign (4)_mask_123.png
+                pattern = re.compile(rf"^{re.escape(base_name)}_mask(_\d+)?{re.escape(ext)}$", re.IGNORECASE)
+                # 查找所有相关的 mask 文件（精准匹配）
+                mask_files = []
+                for mask_fname in os.listdir(cls_dir):
+                    if pattern.match(mask_fname):
+                        mask_files.append(os.path.join(cls_dir, mask_fname))
 
-        self.conv0_3 = DoubleConv(nb_filter[0]*3+nb_filter[1], nb_filter[0])
-        self.conv1_3 = DoubleConv(nb_filter[1]*3+nb_filter[2], nb_filter[1])
+                if not mask_files:
+                    print(f"Warning: No mask found for {img_path}, skipping...")
+                    continue
 
-        self.conv0_4 = DoubleConv(nb_filter[0]*4+nb_filter[1], nb_filter[0])
+                # 合并所有mask（使用逻辑OR保留所有标注区域）
+                merged = None
+                for mp in mask_files:
+                    m = cv2.imread(mp, 0)
+                    if m is None:
+                        print(f"Warning: Cannot read mask {mp}, skipping...")
+                        continue
+                    m = (m > 127).astype(np.uint8)
 
-        if deep_supervision:
-            self.final1 = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
-            self.final2 = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
-            self.final3 = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
-            self.final4 = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
+                    if merged is None:
+                        merged = m
+                    else:
+                        # 使用逻辑OR合并，保留所有mask区域
+                        merged = np.logical_or(merged, m).astype(np.uint8)
+
+                if merged is not None:
+                    self.imgs.append(img_path)
+                    self.masks.append(merged)
+
+                    # 调试信息：显示多mask情况
+                    if len(mask_files) > 1:
+                        print(f"Multi-mask: {img_fname} -> {len(mask_files)} masks merged")
+
+        ids = list(range(len(self.imgs))); random.shuffle(ids)
+        if split == 'all':
+            self.imgs = self.imgs
+            self.masks = self.masks
         else:
-            self.final = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
+            ids = list(range(len(self.imgs)))
+            random.shuffle(ids)
+            split_idx = int(0.8 * len(ids))
+            if split == 'train':
+                ids = ids[:split_idx]
+            else:
+                ids = ids[split_idx:]
+            self.imgs = [self.imgs[i] for i in ids]
+            self.masks = [self.masks[i] for i in ids]
+
+        if split == 'train':
+            self.aug = A.Compose([
+                A.Resize(img_size, img_size),
+                A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.3), A.Rotate(limit=30, p=0.5),
+                A.RandomBrightnessContrast(p=0.4), A.GaussianBlur(blur_limit=3, p=0.2),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)), ToTensorV2()
+            ], is_check_shapes=False)
+        else:
+            self.aug = A.Compose([
+                A.Resize(img_size, img_size),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)), ToTensorV2()
+            ], is_check_shapes=False)
+        assert len(self.imgs) == len(self.masks), f"Length mismatch: {len(self.imgs)} vs {len(self.masks)}"
+        print(f"Dataset {split}: {len(self.imgs)} samples loaded.")
+
+    def __getitem__(self, idx):
+        img = cv2.cvtColor(cv2.imread(self.imgs[idx]), cv2.COLOR_BGR2RGB)
+        # 直接使用已有的mask数组，而不是试图用cv2.imread重新读取
+        mask = self.masks[idx]
+        if mask.sum() == 0:
+            print(f"Warning: All-zero mask at {self.imgs[idx]}")
+
+        aug = self.aug(image=img, mask=mask)
+        img, mask = aug['image'], aug['mask']
+
+        if isinstance(mask, torch.Tensor):
+            mask = mask.unsqueeze(0).float()
+        else:
+            mask = torch.from_numpy(mask).unsqueeze(0).float()
+        # === 新增：确保 mask 是 [0,1] 二值 ===
+        mask = (mask > 0.5).float()
+        bdy = cv2.morphologyEx(mask.squeeze().cpu().numpy().astype(np.uint8),
+                               cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+        bdy = torch.from_numpy(cv2.resize(bdy, (self.img_size, self.img_size))).unsqueeze(0).float()
+        # === 新增：检查是否有 NaN/Inf ===
+        if torch.isnan(img).any() or torch.isinf(img).any():
+            raise ValueError(f"NaN/Inf in image: {self.imgs[idx]}")
+        if torch.isnan(mask).any() or torch.isnan(bdy).any():
+            raise ValueError(f"NaN in mask/bdy: {self.imgs[idx]}")
+        return img, mask, bdy
+
+    def __len__(self):
+        return len(self.imgs)
+
+# ================= 2. Metrics (保持不变) =================
+def dice_score(pred, target, eps=1e-6):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    return ((2 * inter + eps) / (union + eps)).mean().item()
+
+def iou_score(pred, target, eps=1e-6):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) - inter
+    return ((inter + eps) / (union + eps)).mean().item()
+
+def recall_score(pred, target, eps=1e-6):
+    """Recall = TP / (TP + FN)"""
+    pred = (pred > 0.5).float()
+    tp = (pred * target).sum(dim=(2, 3))
+    fn = ((1 - pred) * target).sum(dim=(2, 3))
+    recall = (tp + eps) / (tp + fn + eps)
+    return recall.mean().item()
+
+def hd95_score(pred, target, img_size=512):
+    """
+    修复版的HD95计算函数
+    """
+    if pred.ndim == 3:
+        pred = pred.unsqueeze(1)
+    if target.ndim == 3:
+        target = target.unsqueeze(1)
+
+    pred_bin = (pred > 0.5).float()
+    target_bin = (target > 0.5).float()
+
+    # 计算理论上的最大可能距离（图像对角线）
+    max_dist = np.sqrt(img_size**2 + img_size**2)
+    
+    # 修复：从pred_bin获取批次大小
+    batch_size = pred_bin.shape[0]  # ✅ 正确的获取方式
+    
+    hd95_results = []
+    
+    for i in range(batch_size):
+        pred_single = pred_bin[i:i+1]      # 保持批次维度 [1, 1, H, W]
+        target_single = target_bin[i:i+1]  # 保持批次维度 [1, 1, H, W]
+        
+        # 检查是否都是空mask
+        pred_empty = (pred_single.sum() == 0)
+        target_empty = (target_single.sum() == 0)
+        
+        if pred_empty and target_empty:
+            # 两个都为空，距离为0
+            hd95_results.append(0.0)
+        elif pred_empty or target_empty:
+            # 一个为空一个非空，使用最大距离
+            hd95_results.append(max_dist)
+        else:
+            # 两个都非空，计算HD95
+            try:
+                # 构造one-hot: [1, 2, H, W]
+                pred_oh = torch.cat([1 - pred_single, pred_single], dim=1)
+                target_oh = torch.cat([1 - target_single, target_single], dim=1)
+                
+                hd = compute_hausdorff_distance(
+                    y_pred=pred_oh,
+                    y=target_oh,
+                    include_background=False,
+                    percentile=95,
+                    spacing=1.0  # 明确指定spacing
+                )
+                hd_val = hd[0, 0].item()  # 提取标量值
+                hd95_results.append(min(hd_val, max_dist))  # 限制最大距离
+            except Exception as e:
+                print(f"HD95计算失败样本 {i}: {e}, 使用最大距离")
+                hd95_results.append(max_dist)
+    
+    return np.mean(hd95_results) if hd95_results else max_dist
+        
+# ================= 3. U-Net++ 模型定义 =================
+class DoubleConv(nn.Module):
+    """(Conv2d -> BatchNorm2d -> ReLU) * 2"""
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
-        x0_0 = self.conv0_0(x)
-        x1_0 = self.conv1_0(self.pool(x0_0))
-        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
+        return self.double_conv(x)
 
-        x2_0 = self.conv2_0(self.pool(x1_0))
-        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
-        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
+class UNetPlusPlus(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1, deep_supervision=False):
+        super(UNetPlusPlus, self).__init__()
+        self.deep_supervision = deep_supervision  # 是否启用深层监督（多输出）
+        self.in_channels = in_channels
+        self.num_classes = num_classes
 
-        x3_0 = self.conv3_0(self.pool(x2_0))
-        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
-        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
-        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
+        # 编码器（与标准U-Net一致）
+        self.inc = DoubleConv(in_channels, 64)
+        self.down1 = nn.MaxPool2d(2)
+        self.conv1 = DoubleConv(64, 128)
+        self.down2 = nn.MaxPool2d(2)
+        self.conv2 = DoubleConv(128, 256)
+        self.down3 = nn.MaxPool2d(2)
+        self.conv3 = DoubleConv(256, 512)
+        self.down4 = nn.MaxPool2d(2)
+        self.conv4 = DoubleConv(512, 1024)
 
-        x4_0 = self.conv4_0(self.pool(x3_0))
-        x3_1 = self.conv3_1(torch.cat([x3_0, self.up(x4_0)], 1))
-        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.up(x3_1)], 1))
-        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.up(x2_2)], 1))
-        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.up(x1_3)], 1))
+        # U-Net++ 解码器：多路径密集连接
+        # 第4层（最深层）解码器
+        self.up4_1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.conv4_1 = DoubleConv(512 + 512, 512)  # 拼接conv3输出（512）和up4_1输出（512）
 
+        # 第3层解码器
+        self.up3_1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv3_1 = DoubleConv(256 + 256, 256)  # 拼接conv2输出（256）和up3_1输出（256）
+        self.up3_2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv3_2 = DoubleConv(256 + 256 + 256, 256)  # 拼接conv2输出（256）、up3_1输出（256）、up3_2输出（256）
+
+        # 第2层解码器
+        self.up2_1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv2_1 = DoubleConv(128 + 128, 128)  # 拼接conv1输出（128）和up2_1输出（128）
+        self.up2_2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv2_2 = DoubleConv(128 + 128 + 128, 128)  # 拼接conv1输出（128）、up2_1输出（128）、up2_2输出（128）
+        self.up2_3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv2_3 = DoubleConv(128 + 128 + 128 + 128, 128)  # 拼接conv1输出（128）、up2_1输出（128）、up2_2输出（128）、up2_3输出（128）
+
+        # 第1层解码器
+        self.up1_1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv1_1 = DoubleConv(64 + 64, 64)  # 拼接inc输出（64）和up1_1输出（64）
+        self.up1_2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv1_2 = DoubleConv(64 + 64 + 64, 64)  # 拼接inc输出（64）、up1_1输出（64）、up1_2输出（64）
+        self.up1_3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv1_3 = DoubleConv(64 + 64 + 64 + 64, 64)  # 拼接inc输出（64）、up1_1输出（64）、up1_2输出（64）、up1_3输出（64）
+        self.up1_4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv1_4 = DoubleConv(64 + 64 + 64 + 64 + 64, 64)  # 拼接inc输出（64）、up1_1输出（64）、up1_2输出（64）、up1_3输出（64）、up1_4输出（64）
+
+        # 输出层（主输出 + 深层监督输出）
+        self.outc = nn.Conv2d(64, num_classes, kernel_size=1)
         if self.deep_supervision:
-            output1 = self.final1(x0_1)
-            output2 = self.final2(x0_2)
-            output3 = self.final3(x0_3)
-            output4 = self.final4(x0_4)
-            return (output1 + output2 + output3 + output4) / 4
+            self.outc3 = nn.Conv2d(256, num_classes, kernel_size=1)  # 第3层监督输出
+            self.outc2 = nn.Conv2d(128, num_classes, kernel_size=1)  # 第2层监督输出
+            self.outc1 = nn.Conv2d(64, num_classes, kernel_size=1)   # 第1层监督输出
+
+    def forward(self, x):
+        # 编码器
+        x1 = self.inc(x)           # [B, 64, H, W]
+        x2 = self.down1(x1)        # [B, 64, H/2, W/2]
+        x2 = self.conv1(x2)        # [B, 128, H/2, W/2]
+        x3 = self.down2(x2)        # [B, 128, H/4, W/4]
+        x3 = self.conv2(x3)        # [B, 256, H/4, W/4]
+        x4 = self.down3(x3)        # [B, 256, H/8, W/8]
+        x4 = self.conv3(x4)        # [B, 512, H/8, W/8]
+        x5 = self.down4(x4)        # [B, 512, H/16, W/16]
+        x5 = self.conv4(x5)        # [B, 1024, H/16, W/16]
+
+        # 解码器：第4层
+        x4_1 = self.up4_1(x5)      # [B, 512, H/8, W/8]
+        x4_1 = torch.cat([x4_1, x4], dim=1)  # [B, 512+512, H/8, W/8]
+        x4_1 = self.conv4_1(x4_1)  # [B, 512, H/8, W/8]
+
+        # 解码器：第3层
+        x3_1 = self.up3_1(x4)      # [B, 256, H/4, W/4]
+        x3_1 = torch.cat([x3_1, x3], dim=1)  # [B, 256+256, H/4, W/4]
+        x3_1 = self.conv3_1(x3_1)  # [B, 256, H/4, W/4]
+        
+        x3_2 = self.up3_2(x4_1)    # [B, 256, H/4, W/4]
+        x3_2 = torch.cat([x3_2, x3, x3_1], dim=1)  # [B, 256+256+256, H/4, W/4]
+        x3_2 = self.conv3_2(x3_2)  # [B, 256, H/4, W/4]
+
+        # 解码器：第2层
+        x2_1 = self.up2_1(x3)      # [B, 128, H/2, W/2]
+        x2_1 = torch.cat([x2_1, x2], dim=1)  # [B, 128+128, H/2, W/2]
+        x2_1 = self.conv2_1(x2_1)  # [B, 128, H/2, W/2]
+        
+        x2_2 = self.up2_2(x3_1)    # [B, 128, H/2, W/2]
+        x2_2 = torch.cat([x2_2, x2, x2_1], dim=1)  # [B, 128+128+128, H/2, W/2]
+        x2_2 = self.conv2_2(x2_2)  # [B, 128, H/2, W/2]
+        
+        x2_3 = self.up2_3(x3_2)    # [B, 128, H/2, W/2]
+        x2_3 = torch.cat([x2_3, x2, x2_1, x2_2], dim=1)  # [B, 128+128+128+128, H/2, W/2]
+        x2_3 = self.conv2_3(x2_3)  # [B, 128, H/2, W/2]
+
+        # 解码器：第1层
+        x1_1 = self.up1_1(x2)      # [B, 64, H, W]
+        x1_1 = torch.cat([x1_1, x1], dim=1)  # [B, 64+64, H, W]
+        x1_1 = self.conv1_1(x1_1)  # [B, 64, H, W]
+        
+        x1_2 = self.up1_2(x2_1)    # [B, 64, H, W]
+        x1_2 = torch.cat([x1_2, x1, x1_1], dim=1)  # [B, 64+64+64, H, W]
+        x1_2 = self.conv1_2(x1_2)  # [B, 64, H, W]
+        
+        x1_3 = self.up1_3(x2_2)    # [B, 64, H, W]
+        x1_3 = torch.cat([x1_3, x1, x1_1, x1_2], dim=1)  # [B, 64+64+64+64, H, W]
+        x1_3 = self.conv1_3(x1_3)  # [B, 64, H, W]
+        
+        x1_4 = self.up1_4(x2_3)    # [B, 64, H, W]
+        x1_4 = torch.cat([x1_4, x1, x1_1, x1_2, x1_3], dim=1)  # [B, 64+64+64+64+64, H, W]
+        x1_4 = self.conv1_4(x1_4)  # [B, 64, H, W]
+
+        # 输出
+        out = self.outc(x1_4)  # 主输出 [B, num_classes, H, W]
+
+        # 深层监督：返回多尺度输出（用于训练时多损失监督）
+        if self.deep_supervision:
+            out3 = self.outc3(x3_2)  # [B, num_classes, H/4, W/4]
+            out2 = self.outc2(x2_3)  # [B, num_classes, H/2, W/2]
+            out1 = self.outc1(x1_4)  # [B, num_classes, H, W]
+            # 调整监督输出尺寸与主输出一致（便于损失计算）
+            out3 = F.interpolate(out3, size=out.shape[2:], mode='bilinear', align_corners=False)
+            out2 = F.interpolate(out2, size=out.shape[2:], mode='bilinear', align_corners=False)
+            return out, out2, out3
         else:
-            return self.final(x0_4)
+            return out  # 仅返回主输出（与原U-Net输出格式一致，适配现有训练逻辑）
+
+# ================= 4. 改进的损失函数（适配U-Net++深层监督） =================
+bce = nn.BCEWithLogitsLoss()
+
+def dice_loss(logits, target):
+    pred = torch.sigmoid(logits)
+    inter = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    return 1 - ((2 * inter + 1e-6) / (union + 1e-6)).mean()
+
+def focal_tversky_loss(p, g, alpha=0.3, beta=0.7, gamma=0.75):
+    p = torch.sigmoid(p)
+    tp = (p * g).sum(dim=(2, 3))
+    fp = (p * (1 - g)).sum(dim=(2, 3))
+    fn = ((1 - p) * g).sum(dim=(2, 3))
+    tversky = (tp + 1e-6) / (tp + alpha * fp + beta * fn + 1e-6)
+    return (1 - tversky).pow(gamma).mean()
+
+def segmentation_loss(seg_logits, mask):
+    """仅使用分割损失：BCE + Dice（适配单输出/多输出）"""
+    if isinstance(seg_logits, tuple):
+        # 深层监督：多输出损失加权求和（主输出权重1.0，其余监督输出权重0.5）
+        loss = 0.0
+        main_out = seg_logits[0]
+        loss += (bce(main_out, mask) + dice_loss(main_out, mask))  # 主输出损失
+        for aux_out in seg_logits[1:]:
+            loss += 0.5 * (bce(aux_out, mask) + dice_loss(aux_out, mask))  # 辅助输出损失（权重减半）
+        return loss
+    else:
+        # 单输出：与原逻辑一致
+        bce_loss = nn.BCEWithLogitsLoss()(seg_logits, mask)
+        dice_loss_val = dice_loss(seg_logits, mask)
+        return bce_loss + dice_loss_val
+
+# ================= 5. 可视化工具（保持不变） =================
+def visualize_with_guidance(model, val_loader, epoch, save_dir, num_samples=3):
+    model.eval()
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+
+    with torch.no_grad():
+        for i, (imgs, masks, _) in enumerate(val_loader):  # 不再需要 bdy
+            if i >= num_samples: break
+
+            imgs, masks = imgs.to(device), masks.to(device)
+            seg_logits = model(imgs)
+            # 若为深层监督，取主输出（第一个元素）
+            if isinstance(seg_logits, tuple):
+                seg_logits = seg_logits[0]
+            seg_pred = torch.sigmoid(seg_logits)
+
+            img_np = imgs[0].cpu().permute(1, 2, 0).numpy()
+            img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+            img_np = np.clip(img_np, 0, 1)
+
+            true_mask = masks[0, 0].cpu().numpy()
+            pred_mask = seg_pred[0, 0].cpu().numpy()
+
+            axes[i, 0].imshow(img_np); axes[i, 0].set_title('Original'); axes[i, 0].axis('off')
+            axes[i, 1].imshow(true_mask, cmap='gray'); axes[i, 1].set_title('GT Mask'); axes[i, 1].axis('off')
+            axes[i, 2].imshow(pred_mask, cmap='gray');
+            axes[i, 2].set_title(f'Pred (Dice: {dice_score(seg_pred[0:1], masks[0:1]):.3f})');
+            axes[i, 2].axis('off')
+            axes[i, 3].imshow(img_np); axes[i, 3].imshow(pred_mask > 0.5, alpha=0.5, cmap='jet');
+            axes[i, 3].set_title('Overlay'); axes[i, 3].axis('off')
+
+    plt.tight_layout()
+    if isinstance(epoch, int):
+        plt.savefig(f'{save_dir}/unetplusplus_visualization_epoch_{epoch:03d}.png', dpi=100, bbox_inches='tight')
+    else:
+        plt.savefig(f'{save_dir}/unetplusplus_visualization_{epoch}.png', dpi=100, bbox_inches='tight')
+    plt.close()
+
+# ================= 6. 改进的训练器（保持不变） =================
+def create_optimizer(model):
+    return torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+# ================= 7. 模型评估（保持不变） =================
+def evaluate_fold_model(model_path, val_indices, full_dataset):
+    """评估单个fold的模型，返回该 fold 的指标均值（scalar）"""
+    # 加载U-Net++模型（关闭深层监督，仅输出主结果）
+    model = UNetPlusPlus(deep_supervision=True).to(device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    val_subset = torch.utils.data.Subset(full_dataset, val_indices)
+    val_loader = DataLoader(val_subset, batch_size=1, shuffle=False, num_workers=NUM_WORKERS)
+
+    model.eval()
+    dice_scores, iou_scores, recall_scores, hd95_scores = [], [], [], []
+
+    with torch.no_grad():
+        for imgs, masks, _ in tqdm(val_loader, desc='Evaluating', leave=False):
+            imgs, masks = imgs.to(device), masks.to(device)
+            seg_outputs = model(imgs)  # 可能是多输出（深层监督）
+            # 若为深层监督，取主输出（第一个元素）
+            if isinstance(seg_outputs, tuple):
+                seg = seg_outputs[0]
+            else:
+                seg = seg_outputs  # 单输出时直接赋值（修复漏写逻辑）
+            seg_pred = torch.sigmoid(seg)
+
+            dice_scores.append(dice_score(seg_pred, masks))
+            iou_scores.append(iou_score(seg_pred, masks))
+            recall_scores.append(recall_score(seg_pred, masks))
+            hd95_scores.append(hd95_score(seg_pred, masks))
+
+    # 返回该 fold 的指标均值（scalar）
+    return {
+        'dice': np.mean(dice_scores),
+        'iou': np.mean(iou_scores),
+        'recall': np.mean(recall_scores),
+        'hd95': np.mean(hd95_scores)
+    }
+
+def train_kfold_boundary_guided(k_folds=5):
+    """修复版：确保变量作用域正确，保存验证索引"""
+    full_ds = BUSIDataset(DATA_DIR, 'all', IMG_SIZE)
+    print(f"Total dataset size: {len(full_ds)}")
+
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=SEED)
+    fold_results = []
+    fold_val_indices = []  # 保存每折验证集索引
+
+    for fold, (train_ids, val_ids) in enumerate(kfold.split(full_ds.imgs)):
+        print(f"\n{'=' * 50}")
+        print(f"          FOLD {fold + 1}/{k_folds}")
+        print(f"{'=' * 50}")
+
+        fold_val_indices.append(val_ids)
+
+        # 创建子数据集
+        train_subsampler = torch.utils.data.SubsetRandomSampler(train_ids)
+        val_subsampler = torch.utils.data.SubsetRandomSampler(val_ids)
+
+        train_loader = DataLoader(
+            full_ds, batch_size=BATCH_SIZE, sampler=train_subsampler,
+            num_workers=NUM_WORKERS, pin_memory=True
+        )
+        val_loader = DataLoader(
+            full_ds, batch_size=BATCH_SIZE, sampler=val_subsampler,
+            num_workers=NUM_WORKERS, pin_memory=True, drop_last=False
+        )
+
+        # 初始化U-Net++模型（启用深层监督加速训练收敛）
+        model = UNetPlusPlus(deep_supervision=True).to(device)
+        optimizer = create_optimizer(model)
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=1e-3,
+            epochs=EPOCHS,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.1
+        )
+        scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+        best_dice = 0.0
+        train_losses, val_dices = [], []
+
+        for epoch in range(EPOCHS):
+            # ===== 训练阶段 =====
+            model.train()
+            running_loss = 0.0
+            pbar = tqdm(train_loader, desc=f'Fold {fold + 1} | Epoch {epoch + 1}/{EPOCHS}')
+
+            for imgs, masks, bdys in pbar:
+                imgs, masks, bdys = imgs.to(device), masks.to(device), bdys.to(device)
+                optimizer.zero_grad()
+
+                with torch.cuda.amp.autocast(enabled=USE_AMP):
+                    seg_logits = model(imgs)  # 可能是多输出（深层监督）
+                    loss = segmentation_loss(seg_logits, masks)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                running_loss += loss.item() * imgs.size(0)
+                pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+
+            epoch_loss = running_loss / len(train_ids)
+            train_losses.append(epoch_loss)
+
+            # ===== 验证阶段 =====
+            model.eval()
+            val_dice_accum, n_samples = 0.0, 0
+
+            with torch.no_grad():
+                for imgs, masks, _ in val_loader:
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    with torch.cuda.amp.autocast(enabled=USE_AMP):
+                        seg = model(imgs)  # 可能是多输出
+                        # 取主输出（第一个元素）计算指标
+                        if isinstance(seg, tuple):
+                            seg = seg[0]
+                    seg_pred = torch.sigmoid(seg)
+                    val_dice_accum += dice_score(seg_pred, masks) * imgs.size(0)
+                    n_samples += imgs.size(0)
+
+            # ✅ 关键点：确保 current_dice 在正确作用域内定义
+            current_dice = val_dice_accum / n_samples
+            val_dices.append(current_dice)
+
+            print(f"Epoch {epoch + 1}/{EPOCHS} | Train Loss: {epoch_loss:.4f} | Val Dice: {current_dice:.4f}")
+
+            # ===== 保存最佳模型 =====
+            if current_dice > best_dice:
+                best_dice = current_dice
+                model_path = os.path.join(OUT_DIR, f'best_model_fold_{fold + 1}.pth')
+                torch.save({
+                    'fold': fold,
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'best_dice': best_dice,
+                    'val_indices': val_ids,  # 保存验证索引
+                }, model_path)
+
+            # 定期可视化
+            if (epoch + 1) % 25 == 0 or epoch == EPOCHS - 1:
+                visualize_with_guidance(model, val_loader, f'fold{fold + 1}_epoch{epoch + 1}', OUT_DIR, num_samples=3)
+
+        fold_results.append(best_dice)
+        print(f"✅ Fold {fold + 1} Best Val Dice: {best_dice:.4f}")
+
+        # 绘制训练曲线
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1); plt.plot(train_losses); plt.title(f'Fold {fold + 1} Train Loss')
+        plt.subplot(1, 2, 2); plt.plot(val_dices); plt.title(f'Fold {fold + 1} Val Dice')
+        plt.savefig(os.path.join(OUT_DIR, f'training_curve_fold_{fold + 1}.png'), dpi=100, bbox_inches='tight')
+        plt.close()
+
+    # 汇总结果
+    mean_dice = np.mean(fold_results)
+    std_dice = np.std(fold_results)
+    print(f"\n{'=' * 60}")
+    print(f"📊 5-Fold Cross Validation Results (U-Net++):")
+    print(f"   Mean Dice: {mean_dice:.4f} ± {std_dice:.4f}")
+    print(f"   Per-fold: {[f'{d:.4f}' for d in fold_results]}")
+    print(f"{'=' * 60}")
+
+    return mean_dice, fold_results, fold_val_indices
+
+# ================= 主执行函数 =================
+if __name__ == "__main__":
+    print("=== Boundary-Guided U-Net++ with 5-Fold Cross Validation ===")
+    print(f"输出目录: {OUT_DIR}")
+    print(f"设备: {device}")
+    print(f"图像尺寸: {IMG_SIZE}")
+    print(f"批次大小: {BATCH_SIZE}")
+    print(f"训练轮数: {EPOCHS}")
+
+    # 1. 执行5折交叉验证训练
+    mean_dice, fold_results, val_indices = train_kfold_boundary_guided(k_folds=5)
+
+    # 2. 评估所有fold的最佳模型（每折一个 scalar）
+    print("\n" + "=" * 60)
+    print("📊 正在对每个 fold 的最佳模型进行 Inter-fold 评估...")
+    print("=" * 60)
+
+    # 存储每折的 scalar 指标
+    fold_metrics_list = []  # list of dict, length = 5
+    full_ds = BUSIDataset(DATA_DIR, 'all', IMG_SIZE)
+
+    for fold in range(5):
+        print(f"\n--- 评估 Fold {fold + 1}/{5} ---")
+        checkpoint_path = f'{OUT_DIR}/best_model_fold_{fold + 1}.pth'
+
+        if not os.path.exists(checkpoint_path):
+            print(f"⚠️ 警告: {checkpoint_path} 不存在，跳过此 fold")
+            fold_metrics_list.append({'dice': np.nan, 'iou': np.nan, 'recall': np.nan, 'hd95': np.nan})
+            continue
+
+        fold_metrics = evaluate_fold_model(checkpoint_path, val_indices[fold], full_ds)
+        fold_metrics_list.append(fold_metrics)
+
+        print(f"Fold {fold + 1} 验证集指标:")
+        print(f"  Dice:   {fold_metrics['dice'] * 100:.2f}%")
+        print(f"  IoU:    {fold_metrics['iou'] * 100:.2f}%")
+        print(f"  Recall: {fold_metrics['recall'] * 100:.2f}%")
+        print(f"  HD95:   {fold_metrics['hd95']:.2f} px")
+
+    # 3. 提取每折 scalar，计算 Inter-fold mean ± std
+    dice_per_fold = [m['dice'] for m in fold_metrics_list]
+    iou_per_fold = [m['iou'] for m in fold_metrics_list]
+    recall_per_fold = [m['recall'] for m in fold_metrics_list]
+    hd95_per_fold = [m['hd95'] for m in fold_metrics_list]
+
+    def mean_std_str(vals, multiply=1, fmt=".2f"):
+        vals = np.array(vals)
+        if np.any(np.isnan(vals)):
+            return "NaN"
+        mean = np.mean(vals) * multiply
+        std = np.std(vals, ddof=1) * multiply
+        return f"{mean:{fmt}} ± {std:{fmt}}"
+
+    print("\n" + "=" * 60)
+    print("✅ 纯 Inter-fold 报告（U-Net++，每折一个 scalar）")
+    print("=" * 60)
+    print(f"Dice:   {mean_std_str(dice_per_fold, 100)} %")
+    print(f"IoU:    {mean_std_str(iou_per_fold, 100)} %")
+    print(f"Recall: {mean_std_str(recall_per_fold, 100)} %")
+    print(f"HD95:   {mean_std_str(hd95_per_fold, 1, '.2f')} px")
+
+    # 4. 保存结果
+    summary_path = os.path.join(OUT_DIR, 'kfold_inter_fold_results.txt')
+    with open(summary_path, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("Pure Inter-fold Cross Validation Results (U-Net++)\n")
+        f.write("(One scalar per fold → mean ± std)\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Dice:   {mean_std_str(dice_per_fold, 100)} %\n")
+        f.write(f"IoU:    {mean_std_str(iou_per_fold, 100)} %\n")
+        f.write(f"Recall: {mean_std_str(recall_per_fold, 100)} %\n")
+        f.write(f"HD95:   {mean_std_str(hd95_per_fold, 1, '.2f')} px\n\n")
+
+        f.write("Per-fold scalars:\n")
+        for i, m in enumerate(fold_metrics_list):
+            f.write(f"Fold {i + 1}: Dice={m['dice'] * 100:.2f}%, IoU={m['iou'] * 100:.2f}%, "
+                    f"Recall={m['recall'] * 100:.2f}%, HD95={m['hd95']:.2f}px\n")
+
+    print(f"\n✅ 纯 Inter-fold 结果已保存至: {summary_path}")
