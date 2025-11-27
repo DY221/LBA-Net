@@ -1,83 +1,87 @@
-# ================= 0. 环境 & 数据路径 =================
-!pip install thop albumentations medpy torch==1.13.1 torchvision==0.14.1 --quiet
-!pip install thop
-!pip install albumentations
-!pip install medpy
-!pip install torch==1.13.1+cu116 torchvision==0.14.1 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu116
-import time
-import torch
-import numpy as np
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from thop import profile
-from medpy.metric.binary import hd
-from skimage.metrics import hausdorff_distance as hd_distance
-import pandas as pd
+# ablation-lba.py
 import os
-import cv2
+import time
 import random
+import re
+import csv
+import cv2
+import numpy as np
+from tqdm import tqdm
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import torch.nn as nn
-import timm
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+
+import torch
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
+from torch.optim.lr_scheduler import OneCycleLR
 from sklearn.model_selection import KFold
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
-from medpy.metric.binary import hd
 
-from torch.utils.data import Dataset
+from thop import profile, clever_format
+import pandas as pd
+from LBA_Net import (
+    LBA_Net_BoundaryGuided,
+    boundary_guided_total_loss,
+    dice_score,
+    iou_score,
+    recall_score,
+    hd95_score,
+    create_optimizer,
+)
 
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-from google.colab import drive
-drive.mount('/content/drive', force_remount=True)
-DATA_DIR = "/content/drive/MyDrive/Dataset_BUSI_with_GT-new"
-OUT_DIR = "/content/drive/MyDrive/LBA120_BoundaryGuided3"
+# ===================== 从主模型文件导入 =====================
+DATA_DIR = "/home/wang/ultrasound/Dataset_BUSI_with_GT-new"#BUET_BUSD-new
+#DATA_DIR = "/home/wang/ultrasound/BUET_BUSD-new"
+#OUT_DIR = "/home/wang/ultrasound/unet-BUET"
+OUT_DIR  = "/home/wang/ultrasound/LBA-BUSIablation"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 IMG_SIZE = 512
-BATCH_SIZE = 16
-NUM_WORKERS = 4
-num_epochs = 120  
+BATCH_SIZE = 24
+EPOCHS = 300
+NUM_WORKERS = 12
+USE_AMP = True
 
-# ================= 1. Dataset (保持不变) =================
+# ================ 若主文件里已经有 BUSIDataset，可以删掉下面整个类 =================
 class BUSIDataset(Dataset):
     def __init__(self, root, split='train', img_size=512):
-        self.root, self.split, self.img_size = root, split, img_size
-        cls_list = ['benign', 'malignant', 'normal']
+        self.root = root
+        self.split = split
+        self.img_size = img_size
+        cls_list = ['benign', 'malignant']
         self.imgs, self.masks = [], []
         for cls in cls_list:
             cls_dir = os.path.join(root, cls)
-            if not os.path.isdir(cls_dir): continue
+            if not os.path.isdir(cls_dir):
+                continue
 
-            # 收集所有图像文件（排除mask文件）
-            image_files = [f for f in os.listdir(cls_dir)
-                          if 'mask' not in f.lower() and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            image_files = []
+            for fname in os.listdir(cls_dir):
+                if 'mask' in fname.lower():
+                    continue
+                image_files.append(fname)
 
-            # 为每个图像文件处理对应的mask
             for img_fname in image_files:
                 img_path = os.path.join(cls_dir, img_fname)
-                base = os.path.splitext(img_fname)[0]
-
-                # 查找所有相关的mask文件
-                mask_files = [os.path.join(cls_dir, f) for f in os.listdir(cls_dir)
-                             if 'mask' in f.lower() and base in f.lower() and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                base_name = os.path.splitext(img_fname)[0]
+                ext = os.path.splitext(img_fname)[1].lower()
+                pattern = re.compile(
+                    rf"^{re.escape(base_name)}_mask(_\d+)?{re.escape(ext)}$",
+                    re.IGNORECASE
+                )
+                mask_files = []
+                for mask_fname in os.listdir(cls_dir):
+                    if pattern.match(mask_fname):
+                        mask_files.append(os.path.join(cls_dir, mask_fname))
 
                 if not mask_files:
+                    print(f"Warning: No mask found for {img_path}, skipping...")
                     continue
 
-                # 合并所有mask（使用逻辑OR保留所有标注区域）
                 merged = None
                 for mp in mask_files:
                     m = cv2.imread(mp, 0)
                     if m is None:
+                        print(f"Warning: Cannot read mask {mp}, skipping...")
                         continue
                     m = (m > 127).astype(np.uint8)
 
@@ -89,16 +93,24 @@ class BUSIDataset(Dataset):
                 if merged is not None:
                     self.imgs.append(img_path)
                     self.masks.append(merged)
+                    if len(mask_files) > 1:
+                        print(f"Multi-mask: {img_fname} -> {len(mask_files)} masks merged")
 
         ids = list(range(len(self.imgs)))
         random.shuffle(ids)
-        split_idx = int(0.8 * len(ids))
-        if split == 'train':
-            ids = ids[:split_idx]
+        if split == 'all':
+            # 使用全部数据
+            pass
         else:
-            ids = ids[split_idx:]
-        self.imgs = [self.imgs[i] for i in ids]
-        self.masks = [self.masks[i] for i in ids]
+            ids = list(range(len(self.imgs)))
+            random.shuffle(ids)
+            split_idx = int(0.8 * len(ids))
+            if split == 'train':
+                ids = ids[:split_idx]
+            else:
+                ids = ids[split_idx:]
+            self.imgs = [self.imgs[i] for i in ids]
+            self.masks = [self.masks[i] for i in ids]
 
         if split == 'train':
             self.aug = A.Compose([
@@ -108,817 +120,573 @@ class BUSIDataset(Dataset):
                 A.Rotate(limit=30, p=0.5),
                 A.RandomBrightnessContrast(p=0.4),
                 A.GaussianBlur(blur_limit=3, p=0.2),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                A.Normalize(mean=(0.485, 0.456, 0.406),
+                            std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
-            ])
+            ], is_check_shapes=False)
         else:
             self.aug = A.Compose([
                 A.Resize(img_size, img_size),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                A.Normalize(mean=(0.485, 0.456, 0.406),
+                            std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
-            ])
+            ], is_check_shapes=False)
+
+        assert len(self.imgs) == len(self.masks), \
+            f"Length mismatch: {len(self.imgs)} vs {len(self.masks)}"
+        print(f"Dataset {split}: {len(self.imgs)} samples loaded.")
 
     def __getitem__(self, idx):
         img = cv2.cvtColor(cv2.imread(self.imgs[idx]), cv2.COLOR_BGR2RGB)
         mask = self.masks[idx]
+
+        if mask.sum() == 0:
+            print(f"Warning: All-zero mask at {self.imgs[idx]}")
+
         aug = self.aug(image=img, mask=mask)
-        img, mask = aug['image'], aug['mask']
+        img, mask = aug["image"], aug["mask"]
 
         if isinstance(mask, torch.Tensor):
             mask = mask.unsqueeze(0).float()
         else:
             mask = torch.from_numpy(mask).unsqueeze(0).float()
 
-        bdy = cv2.morphologyEx(mask.squeeze().cpu().numpy().astype(np.uint8),
-                               cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
-        bdy = torch.from_numpy(cv2.resize(bdy, (self.img_size, self.img_size))).unsqueeze(0).float()
+        mask = (mask > 0.5).float()
+
+        bdy = cv2.morphologyEx(
+            mask.squeeze().cpu().numpy().astype(np.uint8),
+            cv2.MORPH_GRADIENT,
+            np.ones((3, 3), np.uint8)
+        )
+        bdy = torch.from_numpy(cv2.resize(
+            bdy, (self.img_size, self.img_size)
+        )).unsqueeze(0).float()
+
+        if torch.isnan(img).any() or torch.isinf(img).any():
+            raise ValueError(f"NaN/Inf in image: {self.imgs[idx]}")
+        if torch.isnan(mask).any() or torch.isnan(bdy).any():
+            raise ValueError(f"NaN in mask/bdy: {self.imgs[idx]}")
         return img, mask, bdy
 
     def __len__(self):
         return len(self.imgs)
 
-# ================= 2. 定义所有模型类 =================
-# ================= 2.1. 基础组件 (保持不变) =================
-class ECA(nn.Module):
-    def __init__(self, c, k=3):
-        super().__init__()
-        self.avg = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
-        self.sig = nn.Sigmoid()
 
-    def forward(self, x):
-        y = self.avg(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        return x * self.sig(y)
-
-class SpatialAtt(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.dw = nn.Sequential(nn.Conv2d(1, 1, 3, padding=1, bias=False), nn.Sigmoid())
-
-    def forward(self, x):
-        return x * self.dw(torch.mean(x, dim=1, keepdim=True))
-
-class LBA_Block(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.eca = ECA(c)
-        self.spa = SpatialAtt()
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-        self.beta = nn.Parameter(torch.tensor(0.5))
-
-    def forward(self, x):
-        return self.alpha * self.eca(x) + self.beta * self.spa(x)
-
-class SEBlock(nn.Module):
-    def __init__(self, reduction=16):
-        super().__init__()
-        self.reduction = reduction
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = None  # 延后初始化
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        if self.fc is None:
-            self.fc = nn.Sequential(
-                nn.Linear(c, c // self.reduction, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(c // self.reduction, c, bias=False),
-                nn.Sigmoid()
-            ).to(x.device)
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        #return x * y
-
-        return x * y.expand_as(x)
-
-class ASPP(nn.Module):
-    def __init__(self, in_c, out_c=96):
-        super().__init__()
-        d = out_c // 4
-        self.d1 = nn.Sequential(
-            nn.Conv2d(in_c, d, 3, padding=6, dilation=6, bias=False),
-            nn.BatchNorm2d(d),
-            nn.ReLU(inplace=True)
-        )
-        self.d2 = nn.Sequential(
-            nn.Conv2d(in_c, d, 3, padding=12, dilation=12, bias=False),
-            nn.BatchNorm2d(d),
-            nn.ReLU(inplace=True)
-        )
-        self.d3 = nn.Sequential(
-            nn.Conv2d(in_c, d, 3, padding=18, dilation=18, bias=False),
-            nn.BatchNorm2d(d),
-            nn.ReLU(inplace=True)
-        )
-        self.gap = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_c, d, 1, bias=False),
-            nn.ReLU(inplace=True)
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(out_c, out_c, 1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.1)
-        )
-
-    def forward(self, x):
-        h, w = x.shape[2:]
-        g = self.gap(x)
-        g = F.interpolate(g, (h, w), mode='bilinear', align_corners=False)
-        y = torch.cat([self.d1(x), self.d2(x), self.d3(x), g], dim=1)
-        return self.fuse(y)
-
-class BoundaryGuidanceModule(nn.Module):
-    """在解码器前加入边界引导，增强边界感知"""
-    def __init__(self, in_channels=576, guidance_channels=32):
-        super().__init__()
-        self.boundary_predictor = nn.Sequential(
-            nn.Conv2d(in_channels, guidance_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(guidance_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(guidance_channels, guidance_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(guidance_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(guidance_channels, 1, 1)  # 输出边界注意力图
-        )
-
-    def forward(self, x):
-        # 生成边界注意力图 [B, 1, H, W]
-        boundary_attention = torch.sigmoid(self.boundary_predictor(x))
-        return boundary_attention
-
-class GuidedDecoderBlock(nn.Module):
-    """带有边界引导的解码块"""
-    def __init__(self, in_ch, skip_ch, out_ch, use_guidance=True):
-        super().__init__()
-        self.use_guidance = use_guidance
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-
-        if self.use_guidance:
-            # 边界引导调制
-            self.guidance_modulation = nn.Sequential(
-                nn.Conv2d(1, 16, 3, padding=1, bias=False),
-                nn.BatchNorm2d(16),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(16, skip_ch, 1, bias=False),
-                nn.Sigmoid()
-            )
-
-        self.se = SEBlock(in_ch + skip_ch)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-        self.lba = LBA_Block(out_ch)
-
-    def forward(self, x, skip, boundary_attention=None):
-        x = self.up(x)
-
-        # 应用边界引导
-        if self.use_guidance and boundary_attention is not None:
-            # 调整边界注意力图尺寸以匹配跳跃连接
-            boundary_attention_resized = F.interpolate(
-                boundary_attention,
-                size=skip.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-            # 调制跳跃连接特征
-            guidance_weight = self.guidance_modulation(boundary_attention_resized)
-            guided_skip = skip * (1 + guidance_weight)
-            x = torch.cat([x, guided_skip], 1)
-        else:
-            x = torch.cat([x, skip], 1)
-
-        x = self.se(x)
-        x = self.conv(x)
-        x = self.lba(x)
-        return x
-
-# ================= 2.2. 模型定义 (基于原模型实现消融) =================
-class LBA_Net_BoundaryGuided(nn.Module):
-    """完整模型：带边界引导的LBA-Net"""
-    def __init__(self):
-        super().__init__()
-        self.enc = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
-        ch = self.enc.feature_info.channels()
-        # 修复：手动设置ch[3]为48（根据错误信息期望144通道：96+48）
-        if len(ch) > 3:
-            ch[3] = 48  # 修正为48以匹配期望的144通道输入
-        self.aspp = ASPP(ch[-1])
-
-        # 边界引导模块
-        self.boundary_guidance = BoundaryGuidanceModule(96)
-
-        # 带有边界引导的解码器
-        self.guided_dec4 = GuidedDecoderBlock(96, ch[3], 96, use_guidance=True)
-        self.dec3 = GuidedDecoderBlock(96, ch[2], 64, use_guidance=False)
-        self.dec2 = GuidedDecoderBlock(64, ch[1], 48, use_guidance=False)
-        self.dec1 = GuidedDecoderBlock(48, ch[0], 24, use_guidance=False)
-
-        # Dual-Head预测
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-        self.bdy_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-
-    def forward(self, x):
-        feats = self.enc(x)
-        x_aspp = self.aspp(feats[-1])  # [B, 96, 16, 16]
-
-        # 生成边界注意力图
-        boundary_attention = self.boundary_guidance(x_aspp)  # [B, 1, 16, 16]
-
-        # 边界引导的解码过程
-        x = self.guided_dec4(x_aspp, feats[3], boundary_attention)  # 第一层使用边界引导
-
-        # 上采样边界注意力图以供后续层使用
-        boundary_attention_up = F.interpolate(boundary_attention, scale_factor=2, mode='bilinear', align_corners=False)
-
-        x = self.dec3(x, feats[2])
-        x = self.dec2(x, feats[1])
-        x = self.dec1(x, feats[0])
-
-        seg = F.interpolate(self.seg_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-        bdy = F.interpolate(self.bdy_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-
-        return seg, bdy, boundary_attention
-
-class LBA_Net_NoLBA(nn.Module):
-    """消融：移除LBA_Block (只保留边界引导)"""
-    def __init__(self):
-        super().__init__()
-        self.enc = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
-        ch = self.enc.feature_info.channels()
-        if len(ch) > 3:
-            ch[3] = 48  # 修复：手动设置ch[3]为48
-        self.aspp = ASPP(ch[-1])
-
-        # 边界引导模块
-        self.boundary_guidance = BoundaryGuidanceModule(96)
-
-        # 带有边界引导的解码器 (移除LBA_Block)
-        self.guided_dec4 = GuidedDecoderBlock(96, ch[3], 96, use_guidance=True)
-        self.dec3 = GuidedDecoderBlock(96, ch[2], 64, use_guidance=False)
-        self.dec2 = GuidedDecoderBlock(64, ch[1], 48, use_guidance=False)
-        self.dec1 = GuidedDecoderBlock(48, ch[0], 24, use_guidance=False)
-
-        # Dual-Head预测
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-        self.bdy_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-
-    def forward(self, x):
-        feats = self.enc(x)
-        x_aspp = self.aspp(feats[-1])
-
-        boundary_attention = self.boundary_guidance(x_aspp)
-
-        # 移除LBA_Block (直接返回conv的输出)
-        x = self.guided_dec4(x_aspp, feats[3], boundary_attention)
-        x = self.dec3(x, feats[2])
-        x = self.dec2(x, feats[1])
-        x = self.dec1(x, feats[0])
-
-        seg = F.interpolate(self.seg_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-        bdy = F.interpolate(self.bdy_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-
-        return seg, bdy, boundary_attention
-
-class LBA_Net_NoASPP(nn.Module):
-    """消融版本：移除 ASPP 模块，直接使用编码器最后一层特征"""
-    def __init__(self):
-        super().__init__()
-        # ========== 1. Encoder ==========
-        self.encoder = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
-        ch = self.encoder.feature_info.channels()  # [16, 16, 24, 48, 576]
-
-        # ========== 2. 用 1x1 Conv 代替 ASPP ==========
-        enc_out_ch = ch[-1]
-        self.conv1x1 = nn.Conv2d(enc_out_ch, 96, kernel_size=1, stride=1, padding=0)
-
-        # ========== 3. 边界引导模块 ==========
-        self.boundary_guidance = BoundaryGuidanceModule(96)
-
-        # ========== 4. 解码器 ==========
-        self.guided_dec4 = GuidedDecoderBlock(96, ch[3], 96, use_guidance=True)
-        self.dec3 = GuidedDecoderBlock(96, ch[2], 64, use_guidance=False)
-        self.dec2 = GuidedDecoderBlock(64, ch[1], 48, use_guidance=False)
-        self.dec1 = GuidedDecoderBlock(48, ch[0], 24, use_guidance=False)
-
-        # ========== 5. Dual-Head 输出 ==========
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-        self.bdy_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-
-    def forward(self, x):
-        # ========== 1. 编码器特征 ==========
-        feats = self.encoder(x)
-
-        # ========== 2. 无 ASPP，使用 1x1 Conv ==========
-        x_enc = self.conv1x1(feats[-1])
-
-        # ========== 3. 边界引导 ==========
-        boundary_attention = self.boundary_guidance(x_enc)
-
-        # ========== 4. 解码器路径 ==========
-        x = self.guided_dec4(x_enc, feats[3], boundary_attention)
-        x = self.dec3(x, feats[2])
-        x = self.dec2(x, feats[1])
-        x = self.dec1(x, feats[0])
-
-        # ========== 5. Dual-Head 输出 ==========
-        seg = F.interpolate(self.seg_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-        bdy = F.interpolate(self.bdy_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-
-        return seg, bdy, boundary_attention
-
-
-class LBA_Net_NoBoundary(nn.Module):
-    """消融：移除边界引导模块 (不使用边界注意力)"""
-    def __init__(self):
-        super().__init__()
-        self.enc = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
-        ch = self.enc.feature_info.channels()
-
-        self.aspp = ASPP(ch[-1])
-
-        # 移除边界引导模块
-        self.boundary_guidance = None
-
-        # 所有解码器层不使用边界引导
-        self.guided_dec4 = GuidedDecoderBlock(96, ch[3], 96, use_guidance=False)
-        self.dec3 = GuidedDecoderBlock(96, ch[2], 64, use_guidance=False)
-        self.dec2 = GuidedDecoderBlock(64, ch[1], 48, use_guidance=False)
-        self.dec1 = GuidedDecoderBlock(48, ch[0], 24, use_guidance=False)
-
-        # Dual-Head预测
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-        self.bdy_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-
-    def forward(self, x):
-        feats = self.enc(x)
-        x_aspp = self.aspp(feats[-1])
-
-        # 不生成边界注意力
-        boundary_attention = None
-
-        x = self.guided_dec4(x_aspp, feats[3], boundary_attention)
-        x = self.dec3(x, feats[2])
-        x = self.dec2(x, feats[1])
-        x = self.dec1(x, feats[0])
-
-        seg = F.interpolate(self.seg_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-        bdy = F.interpolate(self.bdy_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-
-        return seg, bdy, boundary_attention
-
-class LBA_Net_CBAM(nn.Module):
-    """消融：用CBAM替换LBA_Block (CBAM模块)"""
-    def __init__(self):
-        super().__init__()
-        self.enc = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
-        ch = self.enc.feature_info.channels()
-
-        self.aspp = ASPP(ch[-1])
-
-        # 边界引导模块
-        self.boundary_guidance = BoundaryGuidanceModule(96)
-
-        # 带有CBAM的解码器 (替换LBA_Block为CBAM)
-        self.guided_dec4 = GuidedDecoderBlock(96, ch[3], 96, use_guidance=True)
-        self.dec3 = GuidedDecoderBlock(96, ch[2], 64, use_guidance=False)
-        self.dec2 = GuidedDecoderBlock(64, ch[1], 48, use_guidance=False)
-        self.dec1 = GuidedDecoderBlock(48, ch[0], 24, use_guidance=False)
-
-        # Dual-Head预测
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-        self.bdy_head = nn.Sequential(
-            nn.Conv2d(24, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1)
-        )
-
-    def forward(self, x):
-        feats = self.enc(x)
-        x_aspp = self.aspp(feats[-1])
-
-        boundary_attention = self.boundary_guidance(x_aspp)
-
-        # 替换LBA_Block为CBAM (这里我们用CBAM实现，但为简化，我们直接使用LBA_Block的结构)
-        # 实际使用中应替换为CBAM模块
-        x = self.guided_dec4(x_aspp, feats[3], boundary_attention)
-        x = self.dec3(x, feats[2])
-        x = self.dec2(x, feats[1])
-        x = self.dec1(x, feats[0])
-
-        seg = F.interpolate(self.seg_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-        bdy = F.interpolate(self.bdy_head(x), scale_factor=2, mode='bilinear', align_corners=False)
-
-        return seg, bdy, boundary_attention
-
-class DualHeadLoss(nn.Module):
-    def __init__(self, seg_weight=1.0, bdy_weight=0.5):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.seg_weight = seg_weight
-        self.bdy_weight = bdy_weight
-
-    def forward(self, seg_pred, seg_gt, bdy_pred, bdy_gt):
-        loss_seg = self.bce(seg_pred, seg_gt)
-        loss_bdy = self.bce(bdy_pred, bdy_gt)
-        return self.seg_weight * loss_seg + self.bdy_weight * loss_bdy
-
-
-# ================= 2.3. 基准模型 (保持简单) =================
-class BaselineNet(nn.Module):
-    """简单的基准模型 (U-Net风格)"""
-    def __init__(self):
-        super().__init__()
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 16, 3, padding=1),
-            nn.ReLU()
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.ReLU()
-        )
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU()
-        )
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU()
-        )
-        self.dec3 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU()
-        )
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.ReLU()
-        )
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 16, 3, padding=1),
-            nn.ReLU()
-        )
-        self.out = nn.Conv2d(16, 1, 1)
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(F.max_pool2d(e1, 2))
-        e3 = self.enc3(F.max_pool2d(e2, 2))
-        b = self.bottleneck(F.max_pool2d(e3, 2))
-        d3 = self.dec3(F.interpolate(b, scale_factor=2, mode='bilinear'))
-        d2 = self.dec2(F.interpolate(d3, scale_factor=2, mode='bilinear'))
-        d1 = self.dec1(F.interpolate(d2, scale_factor=2, mode='bilinear'))
-        return self.out(d1)
-
-# ================= 3. 定义指标 =================
-def dice_score_tensor(pred, target, eps=1e-6):
-    pred = (pred > 0.5).float()
-    inter = (pred * target).sum(dim=(2, 3))
-    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-    return ((2 * inter + eps) / (union + eps)).mean(dim=1)
-
-def iou_score_tensor(pred, target, eps=1e-6):
-    pred = (pred > 0.5).float()
-    inter = (pred * target).sum(dim=(2, 3))
-    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) - inter
-    return ((inter + eps) / (union + eps)).mean(dim=1)
-
-def recall_score_tensor(pred, target, eps=1e-6):
-    pred = (pred > 0.5).float()
-    tp = (pred * target).sum(dim=(2, 3))
-    fn = ((1 - pred) * target).sum(dim=(2, 3))
-    return (tp / (tp + fn + eps)).mean(dim=1)
-
-def hd_score_batch(pred, target):
-    """批量计算Hausdorff距离 (确保输入是二值掩码)"""
-    batch_hd = []
-    for p, t in zip(pred.cpu().numpy(), target.cpu().numpy()):
-        # 确保是二值掩码 (0/1)
-        p_mask = (p[0] > 0.5).astype(np.uint8)
-        t_mask = (t[0] > 0.5).astype(np.uint8)
-
-        # 处理空掩码情况
-        if np.sum(p_mask) == 0 or np.sum(t_mask) == 0:
-            batch_hd.append(0.0)
-            continue
-
-        # 计算Hausdorff距离
-        batch_hd.append(hd_distance(p_mask, t_mask))
-    return np.mean(batch_hd)
-
-# ================= 4. 消融实验评估函数 =================
-def evaluate_model(model, loader, device):
+# =============================================================
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ==================== Ablation Configs =======================
+
+ABLATION_SETTINGS = {
+    "full": {  # Full (LBA-Net)
+        "name_show": "Full (LBA-Net)",
+        "use_boundary_guidance": True,
+        "use_boundary_head": True,
+        "use_consistency_loss": True,
+        "use_lba_block": True,
+        "use_aspp": True,
+    },
+    "w/o_boundary_guidance": {
+        "name_show": "w/o Boundary Guidance",
+        "use_boundary_guidance": False,
+        "use_boundary_head": True,
+        "use_consistency_loss": True,
+        "use_lba_block": True,
+        "use_aspp": True,
+    },
+    "w/o_boundary_head": {  # single-head
+        "name_show": "w/o Boundary Head (single-head)",
+        "use_boundary_guidance": True,
+        "use_boundary_head": False,
+        "use_consistency_loss": False,
+        "use_lba_block": True,
+        "use_aspp": True,
+    },
+    "w/o_boundary_consistency": {
+        "name_show": "w/o Boundary-Consistency Loss",
+        "use_boundary_guidance": True,
+        "use_boundary_head": True,
+        "use_consistency_loss": False,
+        "use_lba_block": True,
+        "use_aspp": True,
+    },
+    "w/o_lba_block": {
+        "name_show": "w/o LBA-Block",
+        "use_boundary_guidance": True,
+        "use_boundary_head": True,
+        "use_consistency_loss": True,
+        "use_lba_block": False,
+        "use_aspp": True,
+    },
+    "w/o_aspp": {
+        "name_show": "w/o ASPP",
+        "use_boundary_guidance": True,
+        "use_boundary_head": True,
+        "use_consistency_loss": True,
+        "use_lba_block": True,
+        "use_aspp": False,
+    },
+}
+
+# =============== 复杂度 & 速度测试函数 ======================
+
+
+def compute_model_complexity(model, img_size=512):
+    """计算 Params 和 FLOPs"""
+    model = model.to(device)
     model.eval()
-    dice_list, iou_list, recall_list, hd_list = [], [], [], []
+    dummy = torch.randn(1, 3, img_size, img_size).to(device)
+    with torch.no_grad():
+        flops, params = profile(model, inputs=(dummy,), verbose=False)
+    flops_str, params_str = clever_format([flops, params], "%.3f")
+    return flops_str, params_str  # e.g. '12.345G', '3.210M'
+
+
+def measure_gpu_fps(model, img_size=512, runs=200):
+    """GPU 上的推理 FPS"""
+    if not torch.cuda.is_available():
+        return 0.0
+    model = model.to("cuda")
+    model.eval()
+    dummy = torch.randn(1, 3, img_size, img_size).cuda()
 
     with torch.no_grad():
-        for imgs, masks, _ in loader:
-            imgs, masks = imgs.to(device), masks.to(device)
+        # warm-up
+        for _ in range(20):
+            _ = model(dummy)
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(runs):
+            _ = model(dummy)
+        torch.cuda.synchronize()
+        end = time.time()
 
-            # 处理不同模型的输出结构
-            outputs = model(imgs)
-            if isinstance(outputs, (tuple, list)):
-                seg = outputs[0]
-               
-            else:
-                seg = outputs
+    fps = runs / (end - start)
+    return fps
 
 
+def measure_cpu_fps(model, img_size=512, runs=100):
+    """CPU 上的推理 FPS"""
+    model = model.to("cpu")
+    model.eval()
+    dummy = torch.randn(1, 3, img_size, img_size)
+
+    with torch.no_grad():
+        for _ in range(10):
+            _ = model(dummy)
+        start = time.time()
+        for _ in range(runs):
+            _ = model(dummy)
+        end = time.time()
+
+    fps = runs / (end - start)
+    return fps
 
 
-            seg_pred = torch.sigmoid(seg)
+def evaluate_model_complexity_and_speed(cfg):
+    """
+    对某个消融配置实例化一个模型（未训练也没关系），
+    计算 Params, FLOPs, GPU FPS, CPU FPS
+    """
+    model = LBA_Net_BoundaryGuided(
+        use_boundary_guidance=cfg["use_boundary_guidance"],
+        use_boundary_head=cfg["use_boundary_head"],
+        use_lba_block=cfg["use_lba_block"],
+        use_aspp=cfg["use_aspp"],
+    )
+    flops_str, params_str = compute_model_complexity(model, IMG_SIZE)
+    gpu_fps = measure_gpu_fps(model, IMG_SIZE)
+    cpu_fps = measure_cpu_fps(model, IMG_SIZE)
+    return {
+        "Params": params_str,
+        "FLOPs": flops_str,
+        "GPU_FPS": gpu_fps,
+        "CPU_FPS": cpu_fps,
+    }
 
-            dice_list.append(dice_score_tensor(seg_pred, masks).mean().item())
-            iou_list.append(iou_score_tensor(seg_pred, masks).mean().item())
-            recall_list.append(recall_score_tensor(seg_pred, masks).mean().item())
-            hd_list.append(hd_score_batch(seg_pred, masks))
+
+# =================== 训练 & 评估（K-Fold） ====================
+def train_and_eval_ablation(ablation_key, cfg, k_folds=5):
+    """
+    对单个消融配置做 K-Fold 训练 + 验证：
+    - 每个 fold 按 best Val Dice 选最佳 epoch
+    - 保存每个 fold 的最佳模型 checkpoint
+    - 返回各项指标的 mean±std（基于每 fold 的 best 指标）
+    """
+    print(f"\n========== Ablation: {cfg['name_show']} ({ablation_key}) ==========")
+
+    # 建议在主文件开头加上这两行：
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+
+    full_ds = BUSIDataset(DATA_DIR, "all", IMG_SIZE)
+    print(f"Total dataset size: {len(full_ds)}")
+
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=SEED)
+
+    dice_list, iou_list, recall_list, hd95_list = [], [], [], []
+    fold_best_metrics = []  # 记录每个 fold 的最佳指标
+
+    # ⚠️ 关键：用安全 key（把 "/" 换掉）
+    safe_key = ablation_key.replace("/", "_")
+
+    # checkpoint 保存目录：OUT_DIR/ablations/<safe_key>/
+    ablation_ckpt_dir = os.path.join(OUT_DIR, "ablations", safe_key)
+    os.makedirs(ablation_ckpt_dir, exist_ok=True)
+
+    for fold, (train_ids, val_ids) in enumerate(kfold.split(full_ds.imgs)):
+        print(f"\n{'=' * 50}")
+        print(f"[{cfg['name_show']}] Fold {fold + 1}/{k_folds}")
+        print(f"{'=' * 50}")
+
+        train_sampler = SubsetRandomSampler(train_ids)
+        val_sampler = SubsetRandomSampler(val_ids)
+
+        train_loader = DataLoader(
+            full_ds,
+            batch_size=BATCH_SIZE,
+            sampler=train_sampler,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            full_ds,
+            batch_size=1,
+            sampler=val_sampler,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # ====== 初始化模型、优化器、调度器 ======
+        model = LBA_Net_BoundaryGuided(
+            use_boundary_guidance=cfg["use_boundary_guidance"],
+            use_boundary_head=cfg["use_boundary_head"],
+            use_lba_block=cfg["use_lba_block"],
+            use_aspp=cfg["use_aspp"],
+        ).to(device)
+
+        optimizer = create_optimizer(model)
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=[1e-4, 2e-3, 3e-3, 3e-3],
+            epochs=EPOCHS,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.1,
+        )
+        scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+
+        best_dice_fold = -1.0
+        best_metrics_fold = None
+        best_epoch_fold = -1
+        best_ckpt_path = None
+
+        for epoch in range(EPOCHS):
+            # ----------------- Train -----------------
+            model.train()
+            running_loss = 0.0
+            pbar = tqdm(
+                train_loader,
+                desc=f"[{ablation_key}] Fold {fold + 1} | Epoch {epoch + 1}/{EPOCHS}",
+            )
+
+            for imgs, masks, bdys in pbar:
+                imgs = imgs.to(device)
+                masks = masks.to(device)
+                bdys = bdys.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+                    seg_logits, bdy_logits, boundary_att = model(imgs)
+                    loss, _ = boundary_guided_total_loss(
+                        seg_logits,
+                        bdy_logits,
+                        boundary_att,
+                        masks,
+                        bdys,
+                        use_boundary_head=cfg["use_boundary_head"],
+                        use_consistency_loss=cfg["use_consistency_loss"],
+                    )
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                running_loss += loss.item() * imgs.size(0)
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            epoch_loss = running_loss / len(train_ids)
+
+            # ----------------- Validation -----------------
+            model.eval()
+            fold_dice_scores, fold_iou_scores = [], []
+            fold_recall_scores, fold_hd95_scores = [], []
+
+            with torch.no_grad():
+                for imgs, masks, _ in val_loader:
+                    imgs = imgs.to(device)
+                    masks = masks.to(device)
+
+                    with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+                        seg_logits, _, _ = model(imgs)
+                        seg_pred = torch.sigmoid(seg_logits)
+
+                    fold_dice_scores.append(dice_score(seg_pred, masks))
+                    fold_iou_scores.append(iou_score(seg_pred, masks))
+                    fold_recall_scores.append(recall_score(seg_pred, masks))
+                    fold_hd95_scores.append(hd95_score(seg_pred, masks))
+
+            mean_dice_fold = float(np.mean(fold_dice_scores))
+            mean_iou_fold = float(np.mean(fold_iou_scores))
+            mean_recall_fold = float(np.mean(fold_recall_scores))
+            mean_hd95_fold = float(np.mean(fold_hd95_scores))
+
+            print(
+                f"[{ablation_key}] Epoch {epoch + 1}/{EPOCHS} | "
+                f"Train Loss: {epoch_loss:.4f} | "
+                f"Val Dice: {mean_dice_fold:.4f} | "
+                f"IoU: {mean_iou_fold:.4f} | "
+                f"Recall: {mean_recall_fold:.4f} | "
+                f"HD95: {mean_hd95_fold:.2f}"
+            )
+
+            # ====== 按 best Dice 选择最佳 epoch，并保存 checkpoint ======
+            if mean_dice_fold > best_dice_fold:
+                best_dice_fold = mean_dice_fold
+                best_epoch_fold = epoch + 1
+                best_metrics_fold = {
+                    "dice": mean_dice_fold,
+                    "iou": mean_iou_fold,
+                    "recall": mean_recall_fold,
+                    "hd95": mean_hd95_fold,
+                }
+
+                best_ckpt_path = os.path.join(
+                    ablation_ckpt_dir,
+                    f"best_{safe_key}_fold{fold + 1}.pth",
+                )
+                torch.save(
+                    {
+                        "ablation_key": ablation_key,  # 原始 key 继续保留
+                        "cfg": cfg,
+                        "fold": fold,
+                        "epoch": best_epoch_fold,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_metrics": best_metrics_fold,
+                        "val_indices": val_ids,
+                    },
+                    best_ckpt_path,
+                )
+                print(
+                    f"  🔥 New best fold-{fold + 1} model saved at epoch {best_epoch_fold} "
+                    f"(Dice={best_dice_fold:.4f}) → {best_ckpt_path}"
+                )
+
+        # ====== 一个 fold 训练完成后，使用 best epoch 的指标 ======
+        if best_metrics_fold is None:
+            raise RuntimeError(f"No best metrics recorded for fold {fold + 1} of {ablation_key}")
+
+        print(
+            f"\n✅ [{cfg['name_show']}] Fold {fold + 1} BEST @ epoch {best_epoch_fold}: "
+            f"Dice={best_metrics_fold['dice'] * 100:.2f}%, "
+            f"IoU={best_metrics_fold['iou'] * 100:.2f}%, "
+            f"Recall={best_metrics_fold['recall'] * 100:.2f}%, "
+            f"HD95={best_metrics_fold['hd95']:.2f}px"
+        )
+
+        dice_list.append(best_metrics_fold["dice"])
+        iou_list.append(best_metrics_fold["iou"])
+        recall_list.append(best_metrics_fold["recall"])
+        hd95_list.append(best_metrics_fold["hd95"])
+        fold_best_metrics.append(best_metrics_fold)
+
+    # ====== 汇总：计算 mean ± std ======
+    def mean_std(arr):
+        arr = np.array(arr)
+        return float(np.mean(arr)), float(np.std(arr, ddof=1))
+
+    dice_mean, dice_std = mean_std(dice_list)
+    iou_mean, iou_std = mean_std(iou_list)
+    recall_mean, recall_std = mean_std(recall_list)
+    hd95_mean, hd95_std = mean_std(hd95_list)
+
+    print("\n============= Per-fold Best Results =============")
+    for i, m in enumerate(fold_best_metrics):
+        print(
+            f"Fold {i + 1}: "
+            f"Dice={m['dice'] * 100:.2f}%, "
+            f"IoU={m['iou'] * 100:.2f}%, "
+            f"Recall={m['recall'] * 100:.2f}%, "
+            f"HD95={m['hd95']:.2f}px"
+        )
+
+    print("\n============= Cross-fold Summary (best-epoch per fold) =============")
+    print(
+        f"Dice:   {dice_mean * 100:.2f} ± {dice_std * 100:.2f} %\n"
+        f"IoU:    {iou_mean * 100:.2f} ± {iou_std * 100:.2f} %\n"
+        f"Recall: {recall_mean * 100:.2f} ± {recall_std * 100:.2f} %\n"
+        f"HD95:   {hd95_mean:.2f} ± {hd95_std:.2f} px"
+    )
 
     return {
-        "Dice": np.mean(dice_list),
-        "IoU": np.mean(iou_list),
-        "Recall": np.mean(recall_list),
-        "HD": np.mean(hd_list)
+        "Dice_mean": dice_mean,
+        "Dice_std": dice_std,
+        "IoU_mean": iou_mean,
+        "IoU_std": iou_std,
+        "Recall_mean": recall_mean,
+        "Recall_std": recall_std,
+        "HD95_mean": hd95_mean,
+        "HD95_std": hd95_std,
     }
 
-def measure_flops_params(model, device, input_size=(1, 3, 512, 512)):#1, 3, 512, 512
-    """测量模型FLOPs和参数量"""
-    """测量模型FLOPs和参数量，自动忽略thop无法解析的层"""
-    x = torch.randn(input_size).to(device)
-    try:
-        macs, params = profile(model, inputs=(x,), verbose=False)
-        flops = f"{macs/1e9:.3f} GFLOPs"
-        params_str = f"{params/1e6:.3f} M"
-    except Exception as e:
-        print(f"[⚠️ THOP 警告] 无法计算FLOPs：{e}")
-        flops = "N/A"
-        params_str = f"{sum(p.numel() for p in model.parameters())/1e6:.3f} M"
-    return flops, params_str
 
-def measure_inference_speed(model, device, input_size=(1, 3, 512, 512), num_warmup=5, num_runs=100):
-    """测量模型推理速度 (GPU FPS)"""
-    model.eval()
 
-    # 预热
-    with torch.no_grad():
-        for _ in range(num_warmup):
-            _ = model(torch.randn(input_size).to(device))
+# ============================================================
+# 6. 运行全部消融实验 + 保存结果
+# ============================================================
 
-    # 测量推理时间
-    timings = []
-    with torch.no_grad():
-        for _ in range(num_runs):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            _ = model(torch.randn(input_size).to(device))
-            end.record()
-            torch.cuda.synchronize()
-            timings.append(start.elapsed_time(end) / 1000.0)  # 转换为秒
+def run_all_ablations():
+    all_results = {}
 
-    avg_time = np.mean(timings)
-    return 1.0 / avg_time  # GPU FPS
+    for ab_key, cfg in ABLATION_SETTINGS.items():
+        print(f"\n\n================ Running Ablation: {cfg['name_show']} ================")
 
-def train_one_epoch(model, loader, optimizer, device, criterion_seg, criterion_bdy=None):
-    model.train()
-    total_loss = 0
-    for imgs, masks, bdy in loader:
-        imgs, masks, bdy = imgs.to(device), masks.to(device), bdy.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(imgs)
-        
-        if isinstance(outputs, (tuple, list)):
-            seg_pred, bdy_pred = outputs[0], outputs[1]
-        else:
-            seg_pred = outputs
-            bdy_pred = None
-        
-        seg_loss = criterion_seg(torch.sigmoid(seg_pred), masks)
-        
-        if bdy_pred is not None and criterion_bdy is not None:
-            bdy_loss = criterion_bdy(torch.sigmoid(bdy_pred), bdy)
-            loss = seg_loss + bdy_loss
-        else:
-            loss = seg_loss
-        
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
+        # 复杂度 & 速度
+        complexity = evaluate_model_complexity_and_speed(cfg)
 
-def train_one_epoch(model, loader, optimizer, device, criterion_seg, criterion_bdy=None):
-    model.train()
-    total_loss = 0
-    for imgs, masks, bdy in loader:
-        imgs, masks, bdy = imgs.to(device), masks.to(device), bdy.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(imgs)
-        
-        if isinstance(outputs, (tuple, list)):
-            seg_pred, bdy_pred = outputs[0], outputs[1]
-        else:
-            seg_pred = outputs
-            bdy_pred = None
-        
-        seg_loss = criterion_seg(torch.sigmoid(seg_pred), masks)
-        
-        if bdy_pred is not None and criterion_bdy is not None:
-            bdy_loss = criterion_bdy(torch.sigmoid(bdy_pred), bdy)
-            loss = seg_loss + bdy_loss
-        else:
-            loss = seg_loss
-        
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
+        # 5-fold 训练 + 评估
+        metrics = train_and_eval_ablation(ab_key, cfg, k_folds=5)
 
-# ================= 5. 执行消融实验 =================
-def run_ablation(loader, device, out_dir):
-    """执行消融实验并保存结果"""
-    results = {}
-
-    # 确保输出目录存在
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 定义要测试的模型
-    ablation_models = {
-        "Baseline": BaselineNet(),
-        "Full (LBA-Net)": LBA_Net_BoundaryGuided(),
-        "−LBA": LBA_Net_NoLBA(),
-        "−ASPP": LBA_Net_NoASPP(),
-        "−Boundary": LBA_Net_NoBoundary(),
-        "CBAM": LBA_Net_CBAM()
-    }
-
-    # 评估每个模型
-    for name, model in ablation_models.items():
-        print(f"\n{'='*50}")
-        print(f"🔍 Evaluating: {name}")
-        print(f"{'='*50}")
-
-        # 移动模型到设备
-        model = model.to(device)
-
-        # 测量模型指标
-        gflops, params = measure_flops_params(model, device)
-        print(f"  FLOPs: {gflops}, Params: {params}")
-        #gpu_fps = measure_inference_speed(model, device)
-        # 推理速度
-        fps = measure_inference_speed(model, device)
-        print(f"  Inference Speed: {fps:.2f} FPS")
-        # 评估模型性能
-        metrics = evaluate_model(model, loader, device)
-        print(f"  Dice: {metrics['Dice']:.4f}, IoU: {metrics['IoU']:.4f}, "
-              f"Recall: {metrics['Recall']:.4f}, HD: {metrics['HD']:.4f}")
-       # 保存结果
-        results[name] = {
-            **metrics,
-            "FLOPs": gflops,
-            "Params": params,
-            "FPS": f"{fps:.2f}"
+        all_results[ab_key] = {
+            "name_show": cfg["name_show"],
+            "mean_dice": metrics["Dice_mean"],
+            "dice_std": metrics["Dice_std"],
+            "iou_mean": metrics["IoU_mean"],
+            "iou_std": metrics["IoU_std"],
+            "recall_mean": metrics["Recall_mean"],
+            "recall_std": metrics["Recall_std"],
+            "hd95_mean": metrics["HD95_mean"],
+            "hd95_std": metrics["HD95_std"],
+            "Params": complexity["Params"],
+            "FLOPs": complexity["FLOPs"],
+            "GPU_FPS": complexity["GPU_FPS"],
+            "CPU_FPS": complexity["CPU_FPS"],
         }
 
-    # 汇总保存到 CSV
-    df = pd.DataFrame(results).T
-    csv_path = os.path.join(out_dir, "ablation_results.csv")
-    df.to_csv(csv_path)
-    print("\n✅ Ablation Results saved to:", csv_path)
+    return all_results
+
+
+# ============================================================
+# 7. 自动生成论文表格（CSV + LaTeX）
+# ============================================================
+
+def save_results_table(all_results, save_path):
+    rows = []
+    for key, res in all_results.items():
+        rows.append({
+            "Variant": res["name_show"],
+            "Dice (%)": f"{res['mean_dice']*100:.2f}",
+            "Dice std": f"{res['dice_std']*100:.2f}",
+            "IoU (%)": f"{res['iou_mean']*100:.2f}",
+            "IoU std": f"{res['iou_std']*100:.2f}",
+            "Recall (%)": f"{res['recall_mean']*100:.2f}",
+            "Recall std": f"{res['recall_std']*100:.2f}",
+            "HD95 (px)": f"{res['hd95_mean']:.2f}",
+            "HD95 std": f"{res['hd95_std']:.2f}",
+            "Params": res["Params"],
+            "FLOPs": res["FLOPs"],
+            "GPU FPS": f"{res['GPU_FPS']:.2f}",
+            "CPU FPS": f"{res['CPU_FPS']:.2f}",
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(save_path, index=False)
+    print(f"\nSaved ablation results table to: {save_path}")
     print(df)
 
-# ================= 6. 数据加载 =================
-# 创建数据集和加载器
-train_ds = BUSIDataset(DATA_DIR, 'train', IMG_SIZE)
-val_ds = BUSIDataset(DATA_DIR, 'val', IMG_SIZE)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
-def validate(model, loader, device):
-    model.eval()
-    return evaluate_model(model, loader, device)
+def save_latex_table(all_results, latex_path):
+    with open(latex_path, "w") as f:
+        f.write("\\begin{table}[t]\n")
+        f.write("\\centering\n")
+        f.write("\\caption{Ablation study of Boundary-Guided LBA-Net on BUSI*.}\n")
+        f.write("\\begin{tabular}{lcccccccc}\n")
+        f.write("\\toprule\n")
+        f.write("Variant & Dice(\\%) & IoU(\\%) & Recall(\\%) & HD95(px) & Params & FLOPs & GPU~FPS & CPU~FPS \\\\\n")
+        f.write("\\midrule\n")
+
+        for key, res in all_results.items():
+            name = res["name_show"].replace("_", "-")
+            f.write(
+                f"{name} & "
+                f"{res['mean_dice']*100:.2f} $\\pm$ {res['dice_std']*100:.2f} & "
+                f"{res['iou_mean']*100:.2f} $\\pm$ {res['iou_std']*100:.2f} & "
+                f"{res['recall_mean']*100:.2f} $\\pm$ {res['recall_std']*100:.2f} & "
+                f"{res['hd95_mean']:.2f} $\\pm$ {res['hd95_std']:.2f} & "
+                f"{res['Params']} & {res['FLOPs']} & "
+                f"{res['GPU_FPS']:.2f} & {res['CPU_FPS']:.2f} \\\\\n"
+            )
+
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+        f.write("\\end{table}\n")
+
+    print(f"LaTeX ablation table saved to: {latex_path}")
 
 
-# ================= 7. 执行消融实验 =================
+# ============================================================
+# 8. 主入口（Main）
+# ============================================================
+
 if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🚀 Using device: {device}")
+    print("\n==============================")
+    print(" Boundary-Guided LBA-Net Ablation Runner ")
+    print("==============================\n")
 
-    torch.manual_seed(42)
-    if device == 'cuda':
-        torch.cuda.manual_seed_all(42)
-        torch.backends.cudnn.benchmark = True
+    # 运行所有消融实验
+    all_results = run_all_ablations()
 
-    # ================== 训练参数 ==================
-    NUM_EPOCHS = 120
-    LR = 1e-3
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-
-    # 选择训练模型
-    model = LBA_Net_BoundaryGuided().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion_seg = torch.nn.BCELoss()
-    criterion_bdy = torch.nn.BCELoss()  # 双头损失
-
-    best_dice = 0
-
-    for epoch in range(1, NUM_EPOCHS+1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, criterion_seg, criterion_bdy)
-        metrics = validate(model, val_loader, device)
-
-        print(f"Epoch {epoch}/{NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val Dice: {metrics['Dice']:.4f}")
-
-        # 保存最优模型
-        if metrics['Dice'] > best_dice:
-            best_dice = metrics['Dice']
-            torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_model.pth"))
-
-    # ================== 训练结束，执行消融实验 ==================
-    print(f"\n{'='*60}")
-    print("🚀 Starting Ablation Experiment")
-    print(f"{'='*60}")
-
-    ablation_results = run_ablation(val_loader, device, OUT_DIR)
-
-    # 保存结果
-    df = pd.DataFrame(ablation_results).T
-    df.index.name = 'Model'
-    df = df.round(4)
+    # 保存 CSV
     csv_path = os.path.join(OUT_DIR, "ablation_results.csv")
-    df.to_csv(csv_path)
-    md_path = os.path.join(OUT_DIR, "ablation_results.md")
-    with open(md_path, 'w') as f:
-        f.write(df.to_markdown(index=True))
+    save_results_table(all_results, csv_path)
 
-    print("\n" + "="*60)
-    print("✅ Ablation Experiment Results:")
-    print(df)
-    print(f"\nResults saved to: {csv_path}")
-    print(f"Markdown table saved to: {md_path}")
-    print("="*60)
+    # 保存 LaTeX
+    tex_path = os.path.join(OUT_DIR, "ablation_results.tex")
+    save_latex_table(all_results, tex_path)
+
+    # 终端简单打印一版汇总
+    print("\n============= Ablation Summary (mean over 5-fold) =============")
+    header = (
+        f"{'Variant':35s} | {'Dice':>8s} | {'IoU':>8s} | "
+        f"{'Recall':>8s} | {'HD95':>8s} | {'Params':>8s} | {'FLOPs':>8s} | "
+        f"{'GPU FPS':>8s} | {'CPU FPS':>8s}"
+    )
+    print(header)
+    print("-" * len(header))
+    for key, res in all_results.items():
+        print(
+            f"{res['name_show'][:35]:35s} | "
+            f"{res['mean_dice']*100:8.2f} | "
+            f"{res['iou_mean']*100:8.2f} | "
+            f"{res['recall_mean']*100:8.2f} | "
+            f"{res['hd95_mean']:8.2f} | "
+            f"{res['Params']:>8s} | {res['FLOPs']:>8s} | "
+            f"{res['GPU_FPS']:8.2f} | {res['CPU_FPS']:8.2f}"
+        )
+
+    print("\n=== All Ablation Experiments Completed ===\n")
+
+
