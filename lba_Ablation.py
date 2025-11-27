@@ -41,7 +41,7 @@ EPOCHS = 300
 NUM_WORKERS = 12
 USE_AMP = True
 
-# ================ 若主文件里已经有 BUSIDataset，可以删掉下面整个类 =================
+# ================ BUSIDataset=================
 class BUSIDataset(Dataset):
     def __init__(self, root, split='train', img_size=512):
         self.root = root
@@ -336,7 +336,7 @@ def train_and_eval_ablation(ablation_key, cfg, k_folds=5):
     dice_list, iou_list, recall_list, hd95_list = [], [], [], []
     fold_best_metrics = []  # 记录每个 fold 的最佳指标
 
-    # ⚠️ 关键：用安全 key（把 "/" 换掉）
+   
     safe_key = ablation_key.replace("/", "_")
 
     # checkpoint 保存目录：OUT_DIR/ablations/<safe_key>/
@@ -491,7 +491,7 @@ def train_and_eval_ablation(ablation_key, cfg, k_folds=5):
                     best_ckpt_path,
                 )
                 print(
-                    f"  🔥 New best fold-{fold + 1} model saved at epoch {best_epoch_fold} "
+                    f"   New best fold-{fold + 1} model saved at epoch {best_epoch_fold} "
                     f"(Dice={best_dice_fold:.4f}) → {best_ckpt_path}"
                 )
 
@@ -500,7 +500,7 @@ def train_and_eval_ablation(ablation_key, cfg, k_folds=5):
             raise RuntimeError(f"No best metrics recorded for fold {fold + 1} of {ablation_key}")
 
         print(
-            f"\n✅ [{cfg['name_show']}] Fold {fold + 1} BEST @ epoch {best_epoch_fold}: "
+            f" [{cfg['name_show']}] Fold {fold + 1} BEST @ epoch {best_epoch_fold}: "
             f"Dice={best_metrics_fold['dice'] * 100:.2f}%, "
             f"IoU={best_metrics_fold['iou'] * 100:.2f}%, "
             f"Recall={best_metrics_fold['recall'] * 100:.2f}%, "
@@ -590,7 +590,7 @@ def run_all_ablations():
 
 
 # ============================================================
-# 7. 自动生成论文表格（CSV + LaTeX）
+# 7. 
 # ============================================================
 
 def save_results_table(all_results, save_path):
@@ -688,5 +688,6 @@ if __name__ == "__main__":
         )
 
     print("\n=== All Ablation Experiments Completed ===\n")
+
 
 
